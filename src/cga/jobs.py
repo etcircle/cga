@@ -1,4 +1,4 @@
-# src/cga/core/jobs.py
+# src/cga/jobs.py
 """
 This module defines the data structures and manager for handling long-running,
 background jobs, such as code indexing.

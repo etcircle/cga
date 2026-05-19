@@ -1,4 +1,4 @@
-# src/cga/core/watcher.py
+# src/cga/engine/watcher.py
 """
 This module implements the live file-watching functionality using the `watchdog` library.
 It observes directories for changes and triggers updates to the code graph.
