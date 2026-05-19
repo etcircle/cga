@@ -57,7 +57,7 @@ def debug_log(message):
         return
     
     # Get debug log path from config
-    debug_file = _get_config_value('DEBUG_LOG_PATH', os.path.expanduser("~/mcp_debug.log"))
+    debug_file = _get_config_value('DEBUG_LOG_PATH', os.path.expanduser("~/cga_debug.log"))
     
     # Ensure parent directory exists
     Path(debug_file).parent.mkdir(parents=True, exist_ok=True)

@@ -1,10 +1,8 @@
 # src/cga/db/database.py
 """FalkorDB server connection and Neo4j-like compatibility wrappers."""
 
-import importlib.util
 import re
 import threading
-from typing import Optional, Tuple
 
 from cga.config import Config
 from cga.utils.debug_log import error_logger, info_logger
@@ -81,26 +79,6 @@ class FalkorDBManager:
     def get_backend_type(self) -> str:
         """Returns the database backend type."""
         return "falkordb"
-
-    @staticmethod
-    def validate_config(db_path: str = None) -> Tuple[bool, Optional[str]]:
-        """
-        Validates FalkorDB configuration parameters.
-
-        The server-mode client has no local storage path to validate; this method
-        remains for compatibility with older call-sites.
-        """
-        return True, None
-
-    @staticmethod
-    def test_connection(db_path: str = None) -> Tuple[bool, Optional[str]]:
-        """Tests that the FalkorDB client package is available."""
-        try:
-            if importlib.util.find_spec("falkordb") is None:
-                raise ImportError("falkordb")
-            return True, None
-        except ImportError:
-            return False, "FalkorDB client is not installed.\nInstall it with: pip install falkordb"
 
 
 class FalkorDBDriverWrapper:
