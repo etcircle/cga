@@ -154,3 +154,15 @@ def test_find_references_returns_inherits_and_calls(query_core: QueryCore) -> No
     assert call_sources == {"call_helper", "extra"}
 
     assert query_core.find_references("missing")["status"] == "empty"
+
+
+def test_query_core_returns_error_status_instead_of_raising(tmp_path: Path) -> None:
+    # A manager pointed at a port with no FalkorDB server: the query core must
+    # surface status:"error" and never raise — the v1.0 "tools never throw" contract.
+    config = Config(data_dir=tmp_path, falkordb_host="127.0.0.1", falkordb_port=6399)
+    core = QueryCore(FalkorDBManager(config=config, graph_name="unreachable"))
+
+    response = core.find_symbol("anything")
+    assert response["status"] == "error"
+    assert response["results"] == []
+    assert response["warnings"]
