@@ -2,54 +2,62 @@
 type: handoff
 date: 2026-05-19
 status: active
-focus: CGA v1.0 build — run the per-wave loop starting at T2
+focus: CGA v1.1 — the deferred-from-v1.0 work + the cold-index optimization the di-copilot proving surfaced
 ---
 
-# CGA v1.0 — session handoff
+# CGA — handoff after v1.0
 
-**What this is.** CodeGraphAgent (CGA): an agent-first code-graph tool, a fresh
-rebuild of the CodeGraphContext fork. Planning is **done**, v1.0 is **locked**.
-The last session created this repo and the T1 foundation. This session runs the
-build loop.
+**Status.** v1.0 is **SHIPPED**: `etcircle/cga` `main` @ `ca21b1a` (pushed
+2026-05-19). 24 tests pass, `ruff` clean, `uv build` works, CI runs ruff +
+pytest against a `falkordb/falkordb` service container. CGA cold-indexes a repo
+into FalkorDB and serves four MCP tools — `find_symbol`, `find_callers`,
+`find_references`, `index_status`. Proven on `cgc-fork`: 363 files in 65 s,
+exact precision on hand-checked ground truth (`docs/v1.0-proving-run.md`).
 
-**State.**
-- Repo `etcircle/cga` (private), branch `main`, commit `f2da2d3` + this handoff.
-- **Done:** scaffold + `src/cga/config.py` — the injected `Config` (T1
-  foundation), 4 tests passing.
-- **Authoritative plan:** `docs/v1.0-execution-plan.md` (tasks T1-T10).
-  Test plan: `docs/v1.0-test-plan.md`. Vocabulary: `CONTEXT.md`. Tasks: `ROADMAP.md`.
+**Backend — do not reintroduce embedded FalkorDB.** v1.0 connects to a FalkorDB
+*server*; embedded `falkordblite` ships arm64-only macOS binaries that do not
+run on this Intel Mac. Dev: the `cga-falkordb` container (colima + Docker).
+On a fresh boot: `colima start && docker start cga-falkordb`. Reference:
+`docs/adr/0002-falkordb-runs-as-a-server.md`.
 
-**Next — run the standard per-wave loop, T2 onward.** Build order is **serial**.
-Per wave: Hermes implements → peer review → fix nits → test → CC verifies → merge.
-- **Wave 1 / T2** — transplant the FalkorDB Lite layer (`database_falkordb.py` +
-  `falkor_worker.py` + closure) from `~/dev-workspaces/cgc-fork`; stand it up;
-  **freeze the graph schema**.
-- **Wave 2 / T3** — transplant the engine (tree-sitter parsers Python+JS/TS +
-  `graph_builder`); sever the 4 `get_config_value` inversions onto
-  `cga.config.Config` (this completes T1).
-- **Wave 3 / T4** — rewrite the query core against the frozen schema.
-- **Wave 4 / T5-T7** — ToolRegistry, MCP client, `index_status`.
-- **Wave 5 / T8-T10** — tests, packaging + CI, proving run.
+**Run.** From `~/dev-workspaces/cga`: `uv run pytest` (live FalkorDB required);
+`cga mcp` (or `python -m cga.mcp.server`) starts the stdio server for one repo
+(CWD or `CGA_REPO`).
 
-**Do not get burned.**
-- **Kuzu is vaporware** in the fork — not installed, no tests, `database_kuzu.py`
-  is a regex translator. Backend is **FalkorDB Lite**. Do not transplant
-  `database_kuzu.py`.
-- **No `cga` daemon.** FalkorDB Lite's worker IS the server. Clients run the
-  query core in-process.
-- **Freeze the FalkorDB schema** (end of T2/T3) **before** writing the query
-  core (T4). Transplant and rewrite are serial, not parallel.
-- **Proving target** is a small Python-only repo first with numeric bars, not
-  di-copilot. di-copilot is a scale test only.
-- **Do not edit the dead fork** `~/dev-workspaces/cgc-fork` — transplant *from*
-  it (copy), never modify it.
-- Heavy implementation (T2-T8) → **delegate to Hermes**; CC orchestrates,
-  verifies, merges.
+## v1.1 — ready to pick up, priority order
 
-**Kickoff prompt — paste into the fresh session:**
+1. **(P1) Cold-index optimization.** The di-copilot scale test
+   (5017 files / ~90 min, 0.9 files/s vs cgc-fork's 5.6) showed
+   `_create_function_calls` is superlinear — per-call FalkorDB round-trips
+   dominate. Batch the call resolution (UNWIND + `MERGE` for many CALLS edges
+   per round-trip). v1.1's highest-leverage win.
+2. **CLI client** — `cga query` / `cga show` alongside `cga mcp`. The query
+   core is already a clean in-process library (`cga.query.QueryCore`).
+3. **Rest of the tools** — `get_file_structure`, `code_search` (no fulltext on
+   FalkorDB — needs its own match path), `get_module_overview`.
+4. **`graph_query` escape-hatch** + the **ADR-0001 dialect IR** + a **Neo4j
+   renderer**. The v1.0 render seam lives in `src/cga/query/builder.py`; slot
+   the IR under it without touching `core.py`.
+5. **Live `cga watch`** — `src/cga/engine/watcher.py` is carried but unwired;
+   wiring it closes the v1.0 mtime-staleness gap (cross-file `CALLS` edges
+   aren't currently refreshed when a file changes).
+
+## Don't get burned
+
+- The graph schema is **frozen and verified** (`docs/v1.0-graph-schema.md`).
+  Any schema change re-opens the freeze + re-checks the query core.
+- `Module` nodes are global, named after imports — they collide with real
+  symbol names; that is why default `find_symbol` excludes `Module`.
+- **Keep all Cypher in `query/builder.py`** — `core.py` must stay Cypher-free
+  so v1.1's dialect IR slots in under the seam without touching call sites.
+- **CC orchestrates, Hermes implements** the per-wave loop. It ran clean for
+  v1.0 — five waves, every one caught a real review finding. Keep it.
+
+## Kickoff prompt for the new session
 
 ```
-Work in ~/dev-workspaces/cga. Read HANDOFF.md and docs/v1.0-execution-plan.md,
-then run the standard per-wave loop for CGA v1.0 starting at Wave 1 (T2):
-delegate implementation to Hermes, peer-review, test, parent-verify, merge.
+Work in ~/dev-workspaces/cga. Read HANDOFF.md, docs/v1.0-proving-run.md, and
+docs/adr/0002-falkordb-runs-as-a-server.md, then plan v1.1 starting from the
+P1 cold-index optimization (the di-copilot finding) — propose the batching
+design before implementing.
 ```
