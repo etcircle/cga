@@ -30,19 +30,18 @@ def _default_data_dir() -> Path:
 class Config:
     """Immutable runtime configuration, constructed once and injected.
 
-    The fields cover what the v1.0 engine and FalkorDB Lite layer need. Built
-    at the process edge via :meth:`from_env`; never read ambiently inside
+    Built at the process edge via :meth:`from_env`; never read ambiently inside
     engine code — components take a ``Config`` as a constructor argument.
     """
 
     data_dir: Path
-    """Per-user data directory: FalkorDB store, sockets, per-repo graph state."""
+    """Per-user data directory for CGA state."""
 
-    falkordb_socket_path: Path
-    """Unix socket the FalkorDB Lite worker subprocess listens on."""
+    falkordb_host: str = "127.0.0.1"
+    """FalkorDB server host."""
 
-    falkordb_db_path: Path
-    """On-disk path for the FalkorDB Lite store."""
+    falkordb_port: int = 6379
+    """FalkorDB server port."""
 
     index_ignore: tuple[str, ...] = ()
     """Glob patterns for files/dirs to skip when indexing (cgcignore-style)."""
@@ -55,17 +54,16 @@ class Config:
         Everything downstream takes the resulting ``Config`` explicitly.
         """
         root = data_dir or _default_data_dir()
-        socket = os.environ.get("CGA_FALKORDB_SOCKET")
-        db_path = os.environ.get("CGA_FALKORDB_DB")
+        host = os.environ.get("CGA_FALKORDB_HOST", "127.0.0.1")
+        port = int(os.environ.get("CGA_FALKORDB_PORT", "6379"))
         ignore = os.environ.get("CGA_INDEX_IGNORE", "")
         return cls(
             data_dir=root,
-            falkordb_socket_path=Path(socket) if socket else root / "falkordb.sock",
-            falkordb_db_path=Path(db_path) if db_path else root / "falkordb" / "cga.db",
+            falkordb_host=host,
+            falkordb_port=port,
             index_ignore=tuple(p.strip() for p in ignore.split(",") if p.strip()),
         )
 
     def ensure_dirs(self) -> None:
-        """Create the data directories this config points at, if missing."""
+        """Create the data directory this config points at, if missing."""
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.falkordb_db_path.parent.mkdir(parents=True, exist_ok=True)

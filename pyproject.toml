@@ -14,7 +14,6 @@ classifiers = [
 ]
 dependencies = [
     "falkordb>=0.1.0",
-    "falkordblite>=0.1.0; sys_platform != 'win32' and python_version >= '3.12'",
     "tree-sitter>=0.21.0",
     "tree-sitter-language-pack>=0.6.0",
     "watchdog>=3.0.0",
