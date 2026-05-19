@@ -234,9 +234,9 @@ class CGAMCPServer:
                     [Path(path) for path in current]
                 )
                 for path in deleted:
-                    self._delete_file_from_graph(Path(path))
+                    self.graph_builder.delete_file_from_graph(path)
                 for path in changed:
-                    self._delete_file_from_graph(Path(path))
+                    self.graph_builder.delete_file_from_graph(path)
                     self._index_one_file(Path(path), imports_map)
                 self._write_mtime_sidecar(current)
         except Exception as exc:
@@ -251,17 +251,6 @@ class CGAMCPServer:
             self.graph_builder.add_file_to_graph(file_data, self.repo_root.name, imports_map)
             self.graph_builder._create_all_inheritance_links([file_data], imports_map)  # noqa: SLF001
             self.graph_builder._create_all_function_calls([file_data], imports_map)  # noqa: SLF001
-
-    def _delete_file_from_graph(self, path: Path) -> None:
-        with self.db_manager.get_driver().session() as session:
-            session.run(
-                """
-                MATCH (f:File {path: $path})
-                OPTIONAL MATCH (f)-[:CONTAINS*]->(n)
-                DETACH DELETE n, f
-                """,
-                path=str(path.resolve()),
-            )
 
     def _file_count(self) -> int | None:
         try:
