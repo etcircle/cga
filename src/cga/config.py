@@ -46,6 +46,12 @@ class Config:
     index_ignore: tuple[str, ...] = ()
     """Glob patterns for files/dirs to skip when indexing (cgcignore-style)."""
 
+    index_source: bool = False
+    """Whether the engine stores source/docstring text on indexed symbols."""
+
+    skip_external_resolution: bool = False
+    """Whether unresolved external calls should be skipped instead of best-effort linked."""
+
     @classmethod
     def from_env(cls, data_dir: Path | None = None) -> "Config":
         """Build a :class:`Config` from the environment with sane defaults.
@@ -57,11 +63,17 @@ class Config:
         host = os.environ.get("CGA_FALKORDB_HOST", "127.0.0.1")
         port = int(os.environ.get("CGA_FALKORDB_PORT", "6379"))
         ignore = os.environ.get("CGA_INDEX_IGNORE", "")
+        index_source = os.environ.get("CGA_INDEX_SOURCE", "false").lower() == "true"
+        skip_external_resolution = (
+            os.environ.get("CGA_SKIP_EXTERNAL_RESOLUTION", "false").lower() == "true"
+        )
         return cls(
             data_dir=root,
             falkordb_host=host,
             falkordb_port=port,
             index_ignore=tuple(p.strip() for p in ignore.split(",") if p.strip()),
+            index_source=index_source,
+            skip_external_resolution=skip_external_resolution,
         )
 
     def ensure_dirs(self) -> None:
