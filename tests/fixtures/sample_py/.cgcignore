@@ -1,0 +1,11 @@
+# Fixture ignore file to prevent engine auto-generation during tests.
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg
+*.mp4
+*.mp3
+*.zip
+*.tar
+*.gz
