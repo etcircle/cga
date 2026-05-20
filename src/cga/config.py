@@ -52,6 +52,16 @@ class Config:
     skip_external_resolution: bool = False
     """Whether unresolved external calls should be skipped instead of best-effort linked."""
 
+    calls_batch_size: int = 2000
+    """How many CALLS-edge specs to MERGE per UNWIND round-trip during cold indexing.
+
+    The cold-index pass buffers per-call specs across files and flushes them via
+    a single polymorphic UNWIND/MERGE Cypher statement; this knob bounds the
+    UNWIND payload. v1.1 default (2000) keeps each statement under ~1 MB of
+    parameters and was validated against the di-copilot proving repo. Override
+    via ``CGA_CALLS_BATCH_SIZE``.
+    """
+
     @classmethod
     def from_env(cls, data_dir: Path | None = None) -> "Config":
         """Build a :class:`Config` from the environment with sane defaults.
@@ -67,6 +77,7 @@ class Config:
         skip_external_resolution = (
             os.environ.get("CGA_SKIP_EXTERNAL_RESOLUTION", "false").lower() == "true"
         )
+        calls_batch_size = int(os.environ.get("CGA_CALLS_BATCH_SIZE", "2000"))
         return cls(
             data_dir=root,
             falkordb_host=host,
@@ -74,6 +85,7 @@ class Config:
             index_ignore=tuple(p.strip() for p in ignore.split(",") if p.strip()),
             index_source=index_source,
             skip_external_resolution=skip_external_resolution,
+            calls_batch_size=calls_batch_size,
         )
 
     def ensure_dirs(self) -> None:
