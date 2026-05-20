@@ -13,3 +13,4 @@ htmlcov/
 *.so
 .DS_Store
 uv.lock
+_local-archive/
