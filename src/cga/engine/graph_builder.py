@@ -136,6 +136,10 @@ class GraphBuilder:
         # _create_all_function_calls invocation, including watcher/MCP deltas.
         self._inscope_buf: list[dict] = []
         self._filescope_buf: list[dict] = []
+        # v1.2 P0.5 sub-phase accumulators for the `function_calls` phase.
+        # Populated only when Config.profile_phases is on; cleared at the
+        # start of every _create_all_function_calls invocation.
+        self._call_phase: dict[str, float] = {}
         self.create_schema()
 
     # A general schema creation based on common features across languages
@@ -616,6 +620,18 @@ class GraphBuilder:
             share = (sec / elapsed * 100.0) if elapsed > 0 else 0.0
             per_file = (sec * 1000.0 / file_count) if file_count > 0 else 0.0
             lines.append(f"  {name:22} {sec:8.2f} s  {share:5.1f}%  {per_file:7.2f} ms/file")
+            # v1.2 P0.5 sub-rows for the function_calls phase, if instrumented.
+            if name == "function_calls" and self._call_phase:
+                fc_total = sec if sec > 0 else 1.0  # avoid /0
+                for sub in ("resolve", "flush_inscope", "flush_filescope"):
+                    sub_sec = self._call_phase.get(sub, 0.0)
+                    if sub_sec == 0.0:
+                        continue
+                    sub_share = sub_sec / fc_total * 100.0
+                    sub_per_file = (sub_sec * 1000.0 / file_count) if file_count > 0 else 0.0
+                    lines.append(
+                        f"    └─ {sub:18} {sub_sec:8.2f} s  {sub_share:5.1f}% of function_calls  {sub_per_file:7.2f} ms/file"
+                    )
         accounted = sum(phase_total.values())
         unaccounted = max(0.0, elapsed - accounted)
         if elapsed > 0:
@@ -636,23 +652,34 @@ class GraphBuilder:
         (called once at the end of :meth:`_create_all_function_calls`).
         """
         chunk = self.config.calls_batch_size
+        profile = self.config.profile_phases
         while self._inscope_buf and (force or len(self._inscope_buf) >= chunk):
             head = self._inscope_buf[:chunk]
             del self._inscope_buf[:chunk]
+            _t = time.monotonic() if profile else 0.0
             try:
                 session.run(self._INSCOPE_BATCH_CYPHER, batch=head)
             except Exception as exc:
                 warning_logger(
                     f"In-scope CALLS batch flush failed (size={len(head)}): {exc}"
                 )
+            if profile:
+                self._call_phase["flush_inscope"] = (
+                    self._call_phase.get("flush_inscope", 0.0) + (time.monotonic() - _t)
+                )
         while self._filescope_buf and (force or len(self._filescope_buf) >= chunk):
             head = self._filescope_buf[:chunk]
             del self._filescope_buf[:chunk]
+            _t = time.monotonic() if profile else 0.0
             try:
                 session.run(self._FILESCOPE_BATCH_CYPHER, batch=head)
             except Exception as exc:
                 warning_logger(
                     f"File-scope CALLS batch flush failed (size={len(head)}): {exc}"
+                )
+            if profile:
+                self._call_phase["flush_filescope"] = (
+                    self._call_phase.get("flush_filescope", 0.0) + (time.monotonic() - _t)
                 )
 
     def _create_all_function_calls(self, all_file_data: list[Dict], imports_map: dict):
@@ -666,10 +693,18 @@ class GraphBuilder:
         debug_log(f"_create_all_function_calls called with {len(all_file_data)} files")
         self._inscope_buf.clear()
         self._filescope_buf.clear()
+        self._call_phase.clear()
+        profile = self.config.profile_phases
         with self.driver.session() as session:
             for idx, file_data in enumerate(all_file_data):
                 debug_log(f"Processing file {idx+1}/{len(all_file_data)}: {file_data.get('path', 'unknown')}")
+                _t_resolve = time.monotonic() if profile else 0.0
                 self._create_function_calls(file_data, imports_map)
+                if profile:
+                    self._call_phase["resolve"] = (
+                        self._call_phase.get("resolve", 0.0) + (time.monotonic() - _t_resolve)
+                    )
+                # NOTE: flush sub-timing is captured inside _flush_call_batches itself.
                 self._flush_call_batches(session, force=False)
             self._flush_call_batches(session, force=True)
 
