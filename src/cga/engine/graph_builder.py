@@ -68,6 +68,53 @@ class TreeSitterParser:
 class GraphBuilder:
     """Module for building and managing the Neo4j code graph."""
 
+    # v1.1 cold-index batching — see docs/plans/v1.1-cold-index-batching.md.
+    # Two templates, one per caller bucket. Both end in a single polymorphic
+    # MERGE so each UNWIND item produces at most one CALLS edge, preserving
+    # v1.0's mid-cascade short-circuit semantics without a round-trip cascade.
+    # Note: the MERGE clause does not RETURN — FalkorDB's `count(r)` after
+    # MERGE counts invocations, not new edges; relying on it for telemetry
+    # is a footgun, so the templates stay write-only.
+    _INSCOPE_BATCH_CYPHER = """
+    UNWIND $batch AS item
+    OPTIONAL MATCH (cF:Function {name: item.caller_name, path: item.caller_path})
+    OPTIONAL MATCH (cC:Class    {name: item.caller_name, path: item.caller_path})
+    WITH item, COALESCE(cF, cC) AS caller
+    OPTIONAL MATCH (tF:Function {name: item.called_name, path: item.called_path})
+    OPTIONAL MATCH (tC:Class    {name: item.called_name, path: item.called_path})
+    OPTIONAL MATCH (tC)-[:CONTAINS]->(tInit:Function)
+      WHERE tInit.name IN ['__init__', 'constructor']
+    WITH item, caller, COALESCE(tF, tInit, tC) AS exact
+    OPTIONAL MATCH (fbF:Function {name: item.called_name})
+      WHERE exact IS NULL
+    WITH item, caller, COALESCE(exact, fbF) AS called
+    WHERE caller IS NOT NULL AND called IS NOT NULL
+    MERGE (caller)-[:CALLS {
+      line_number:    item.line_number,
+      full_call_name: item.full_call_name,
+      args:           item.args
+    }]->(called)
+    """
+
+    _FILESCOPE_BATCH_CYPHER = """
+    UNWIND $batch AS item
+    OPTIONAL MATCH (caller:File {path: item.caller_path})
+    OPTIONAL MATCH (tF:Function {name: item.called_name, path: item.called_path})
+    OPTIONAL MATCH (tC:Class    {name: item.called_name, path: item.called_path})
+    OPTIONAL MATCH (tC)-[:CONTAINS]->(tInit:Function)
+      WHERE tInit.name IN ['__init__', 'constructor']
+    WITH item, caller, COALESCE(tF, tInit, tC) AS exact
+    OPTIONAL MATCH (fbF:Function {name: item.called_name})
+      WHERE exact IS NULL
+    WITH item, caller, COALESCE(exact, fbF) AS called
+    WHERE caller IS NOT NULL AND called IS NOT NULL
+    MERGE (caller)-[:CALLS {
+      line_number:    item.line_number,
+      full_call_name: item.full_call_name,
+      args:           item.args
+    }]->(called)
+    """
+
     def __init__(self, config: Config, db_manager: FalkorDBManager, job_manager: JobManager):
         self.config = config
         self.db_manager = db_manager
@@ -83,6 +130,11 @@ class GraphBuilder:
             ".ts": TreeSitterParser("typescript"),
             ".tsx": TreeSitterParser("typescriptjsx"),
         }
+        # Cross-file buffers populated by _create_function_calls and drained by
+        # _flush_call_batches. Cleared/forced at the start/end of every
+        # _create_all_function_calls invocation, including watcher/MCP deltas.
+        self._inscope_buf: list[dict] = []
+        self._filescope_buf: list[dict] = []
         self.create_schema()
 
     # A general schema creation based on common features across languages
@@ -378,12 +430,21 @@ class GraphBuilder:
             return False
 
 
-    def _create_function_calls(self, session, file_data: Dict, imports_map: dict):
-        """Create CALLS relationships with a unified, prioritized logic flow for all call types."""
+    def _create_function_calls(self, file_data: Dict, imports_map: dict):
+        """Buffer CALLS-edge specs for the next batch flush.
+
+        v1.0 issued up to 5 sequential MERGE round-trips per call site through a
+        Function/Class/File label cascade. v1.1 resolves each call to a single
+        (caller_label-agnostic, callee_label-agnostic) spec in pure Python and
+        appends it to a cross-file buffer; the polymorphic UNWIND/MERGE in
+        :meth:`_flush_call_batches` then collapses all of v1.0's cascade
+        branches into one Cypher statement per chunk. The resolution algorithm
+        below is unchanged — the only difference is the persistence path.
+        """
         caller_file_path = str(Path(file_data['path']).resolve())
         num_calls = len(file_data.get('function_calls', []))
         if num_calls > 0:
-            debug_log(f"Creating function calls for {caller_file_path} (Count: {num_calls})")
+            debug_log(f"Buffering function calls for {caller_file_path} (Count: {num_calls})")
         
         local_names = {f['name'] for f in file_data.get('functions', [])} | \
                       {c['name'] for c in file_data.get('classes', [])}
@@ -500,125 +561,74 @@ class GraphBuilder:
             if skip_external and is_unresolved_external:
                 continue
 
+            # Buffer the spec; the polymorphic UNWIND/MERGE in
+            # _flush_call_batches handles every label combination v1.0's
+            # cascade used to handle one round-trip at a time.
+            spec = {
+                "caller_path": caller_file_path,
+                "called_name": called_name,
+                "called_path": resolved_path,
+                "line_number": call['line_number'],
+                "args": call.get('args', []),
+                "full_call_name": call.get('full_name', called_name),
+            }
             caller_context = call.get('context')
             if caller_context and len(caller_context) == 3 and caller_context[0] is not None:
-                caller_name, _, caller_line_number = caller_context
-                
-                # KùzuDB workaround: Try Function->Function first, then other combinations
-                # This avoids polymorphic MERGE which KùzuDB doesn't support
-                call_params = {
-                    'caller_name': caller_name,
-                    'caller_file_path': caller_file_path,
-                    'caller_line_number': caller_line_number,
-                    'called_name': called_name,
-                    'called_file_path': resolved_path,
-                    'line_number': call['line_number'],
-                    'args': call.get('args', []),
-                    'full_call_name': call.get('full_name', called_name)
-                }
-                
-                # Try Function caller -> Function callee
-                if not self._safe_run_create(session, """
-                    OPTIONAL MATCH (caller:Function {name: $caller_name, path: $caller_file_path})
-                    OPTIONAL MATCH (called:Function {name: $called_name, path: $called_file_path})
-                    WITH caller, called
-                    WHERE caller IS NOT NULL AND called IS NOT NULL
-                    MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(called)
-                    RETURN count(*) as created
-                """, call_params):
-                
-                    # Try Function caller -> Class callee (with __init__ resolution)
-                    if not self._safe_run_create(session, """
-                        OPTIONAL MATCH (caller:Function {name: $caller_name, path: $caller_file_path})
-                        OPTIONAL MATCH (called:Class {name: $called_name, path: $called_file_path})
-                        OPTIONAL MATCH (called)-[:CONTAINS]->(init:Function)
-                        WHERE init.name IN ["__init__", "constructor"]
-                        WITH caller, COALESCE(init, called) as final_target
-                        WHERE caller IS NOT NULL AND final_target IS NOT NULL
-                        MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(final_target)
-                        RETURN count(*) as created
-                    """, call_params):
-                
-                        # Try Class caller -> Function callee
-                        if not self._safe_run_create(session, """
-                            OPTIONAL MATCH (caller:Class {name: $caller_name, path: $caller_file_path})
-                            OPTIONAL MATCH (called:Function {name: $called_name, path: $called_file_path})
-                            WITH caller, called
-                            WHERE caller IS NOT NULL AND called IS NOT NULL
-                            MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(called)
-                            RETURN count(*) as created
-                        """, call_params):
-                
-                            # Try Class caller -> Class callee
-                            if not self._safe_run_create(session, """
-                                OPTIONAL MATCH (caller:Class {name: $caller_name, path: $caller_file_path})
-                                OPTIONAL MATCH (called:Class {name: $called_name, path: $called_file_path})
-                                OPTIONAL MATCH (called)-[:CONTAINS]->(init:Function)
-                                WHERE init.name IN ["__init__", "constructor"]
-                                WITH caller, COALESCE(init, called) as final_target
-                                WHERE caller IS NOT NULL AND final_target IS NOT NULL
-                                MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(final_target)
-                                RETURN count(*) as created
-                            """, call_params):
-
-                                 # Fallback: Relaxed Global Search (Caller: Function/Class -> Callee: Function)
-                                 # Used when path resolution failed or was ambiguous
-                                 self._safe_run_create(session, """
-                                    OPTIONAL MATCH (caller:Function {name: $caller_name, path: $caller_file_path}) 
-                                    OPTIONAL MATCH (callerClass:Class {name: $caller_name, path: $caller_file_path})
-                                    WITH COALESCE(caller, callerClass) as final_caller
-                                    OPTIONAL MATCH (called:Function {name: $called_name})
-                                    WITH final_caller, called
-                                    WHERE final_caller IS NOT NULL AND called IS NOT NULL
-                                    MERGE (final_caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(called)
-                                """, call_params)
+                caller_name, _, _caller_line_number = caller_context
+                spec["caller_name"] = caller_name
+                self._inscope_buf.append(spec)
             else:
-                # File-level calls: Try Function first, then Class
-                call_params = {
-                    'caller_file_path': caller_file_path,
-                    'called_name': called_name,
-                    'called_file_path': resolved_path,
-                    'line_number': call['line_number'],
-                    'args': call.get('args', []),
-                    'full_call_name': call.get('full_name', called_name)
-                }
-                
-                if not self._safe_run_create(session, """
-                    OPTIONAL MATCH (caller:File {path: $caller_file_path})
-                    OPTIONAL MATCH (called:Function {name: $called_name, path: $called_file_path})
-                    WITH caller, called
-                    WHERE caller IS NOT NULL AND called IS NOT NULL
-                    MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(called)
-                    RETURN count(*) as created
-                """, call_params):
-                
-                    if not self._safe_run_create(session, """
-                        OPTIONAL MATCH (caller:File {path: $caller_file_path})
-                        OPTIONAL MATCH (called:Class {name: $called_name, path: $called_file_path})
-                        OPTIONAL MATCH (called)-[:CONTAINS]->(init:Function)
-                        WHERE init.name IN ["__init__", "constructor"]
-                        WITH caller, COALESCE(init, called) as final_target
-                        WHERE caller IS NOT NULL AND final_target IS NOT NULL
-                        MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(final_target)
-                        RETURN count(*) as created
-                    """, call_params):
+                # File-level caller: no caller_name; the file-scope batch
+                # template matches (:File) by caller_path directly.
+                self._filescope_buf.append(spec)
 
-                         # Fallback: Relaxed Global Search (Caller: File -> Callee: Function)
-                         self._safe_run_create(session, """
-                            OPTIONAL MATCH (caller:File {path: $caller_file_path})
-                            OPTIONAL MATCH (called:Function {name: $called_name})
-                            WITH caller, called
-                            WHERE caller IS NOT NULL AND called IS NOT NULL
-                            MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(called)
-                        """, call_params)
+    def _flush_call_batches(self, session, *, force: bool = False) -> None:
+        """Drain the CALLS-edge buffers into FalkorDB.
+
+        Each bucket is flushed in chunks of ``Config.calls_batch_size`` via a
+        single polymorphic UNWIND/MERGE per chunk. With ``force=False`` only
+        chunks of at least one full ``calls_batch_size`` are sent (called
+        between files during cold indexing to bound memory); ``force=True``
+        drains everything that remains, including a partial last chunk
+        (called once at the end of :meth:`_create_all_function_calls`).
+        """
+        chunk = self.config.calls_batch_size
+        while self._inscope_buf and (force or len(self._inscope_buf) >= chunk):
+            head = self._inscope_buf[:chunk]
+            del self._inscope_buf[:chunk]
+            try:
+                session.run(self._INSCOPE_BATCH_CYPHER, batch=head)
+            except Exception as exc:
+                warning_logger(
+                    f"In-scope CALLS batch flush failed (size={len(head)}): {exc}"
+                )
+        while self._filescope_buf and (force or len(self._filescope_buf) >= chunk):
+            head = self._filescope_buf[:chunk]
+            del self._filescope_buf[:chunk]
+            try:
+                session.run(self._FILESCOPE_BATCH_CYPHER, batch=head)
+            except Exception as exc:
+                warning_logger(
+                    f"File-scope CALLS batch flush failed (size={len(head)}): {exc}"
+                )
 
     def _create_all_function_calls(self, all_file_data: list[Dict], imports_map: dict):
-        """Create CALLS relationships for all functions after all files have been processed."""
+        """Create CALLS relationships for all functions after all files have been processed.
+
+        Two-phase: per-file resolution + threshold flush, then a final force
+        flush. The buffers are cleared at entry so MCP single-file deltas and
+        the watcher's incremental refreshes never inherit state from a prior
+        call.
+        """
         debug_log(f"_create_all_function_calls called with {len(all_file_data)} files")
+        self._inscope_buf.clear()
+        self._filescope_buf.clear()
         with self.driver.session() as session:
             for idx, file_data in enumerate(all_file_data):
                 debug_log(f"Processing file {idx+1}/{len(all_file_data)}: {file_data.get('path', 'unknown')}")
-                self._create_function_calls(session, file_data, imports_map)
+                self._create_function_calls(file_data, imports_map)
+                self._flush_call_batches(session, force=False)
+            self._flush_call_batches(session, force=True)
 
     def _create_inheritance_links(self, session, file_data: Dict, imports_map: dict):
         """Create INHERITS relationships with a more robust resolution logic."""

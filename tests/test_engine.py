@@ -173,3 +173,174 @@ def test_js_and_ts_parsers_parse_trivial_snippets(tmp_path: Path) -> None:
     assert "error" not in ts_data
     assert any(function["name"] == "hello" for function in js_data["functions"])
     assert any(function["name"] == "typed" for function in ts_data["functions"])
+
+
+def test_v1_1_batch_resolves_function_to_class_and_self_calls(tmp_path: Path) -> None:
+    """The v1.1 polymorphic batch must keep v1.0's Function→Class fall-through.
+
+    The shared fixture has two call sites that exercise the COALESCE chain:
+      * ``main.py:make_child()`` calls ``Child()`` — no ``__init__`` on Child,
+        so the new batch's ``COALESCE(tF, tInit, tC)`` must fall through to
+        ``tC`` (the Class node) and produce a Function→Class CALLS edge.
+      * ``models.py:child_method()`` calls ``self.base_method()`` — direct
+        self-call, resolution stays inside ``models.py`` and produces a
+        Function→Function edge to ``Base.base_method``.
+    """
+    config = _config(tmp_path)
+    manager = _manager_or_skip(config)
+
+    try:
+        builder = GraphBuilder(config, manager, JobManager())
+        asyncio.run(builder.build_graph_from_path_async(FIXTURE))
+
+        driver = manager.get_driver()
+        main_path = str((FIXTURE / "main.py").resolve())
+        models_path = str((FIXTURE / "models.py").resolve())
+
+        with driver.session() as session:
+            # Function (call_helper-style caller) → Class (Child) — Class fall-through
+            # because Child has no __init__ method in the fixture.
+            class_call = _single(
+                session,
+                """
+                MATCH (caller:Function {name: 'make_child', path: $main})
+                      -[r:CALLS]->
+                      (target:Class {name: 'Child', path: $models})
+                RETURN count(r) AS c, r.full_call_name AS full_call_name
+                """,
+                main=main_path,
+                models=models_path,
+            )
+            assert class_call["c"] == 1
+            assert class_call["full_call_name"] == "Child"
+
+            # Function → Function via self.method() — same-file resolution.
+            self_call = _single(
+                session,
+                """
+                MATCH (caller:Function {name: 'child_method', path: $models})
+                      -[r:CALLS]->
+                      (target:Function {name: 'base_method', path: $models})
+                RETURN count(r) AS c, r.full_call_name AS full_call_name
+                """,
+                models=models_path,
+            )
+            assert self_call["c"] == 1
+            assert self_call["full_call_name"] == "self.base_method"
+    finally:
+        if manager._graph is not None:
+            manager._graph.delete()
+        manager.close_driver()
+
+
+def test_v1_1_batch_creates_file_scope_calls_edge(tmp_path: Path) -> None:
+    """Module-level call expressions must produce a File→Function CALLS edge.
+
+    Exercises the second batch template (``_FILESCOPE_BATCH_CYPHER``): the
+    caller has no enclosing function/class, so the buffer entry omits
+    ``caller_name`` and the batch matches ``(:File {path: ...})`` directly.
+    """
+    fixture = tmp_path / "filescope"
+    fixture.mkdir()
+    (fixture / "lib.py").write_text("def util(x):\n    return x + 1\n", encoding="utf-8")
+    (fixture / "entry.py").write_text(
+        "from lib import util\n\nutil(5)\n",
+        encoding="utf-8",
+    )
+
+    config = _config(tmp_path)
+    manager = _manager_or_skip(config)
+
+    try:
+        builder = GraphBuilder(config, manager, JobManager())
+        asyncio.run(builder.build_graph_from_path_async(fixture))
+
+        driver = manager.get_driver()
+        entry_path = str((fixture / "entry.py").resolve())
+        lib_path = str((fixture / "lib.py").resolve())
+
+        with driver.session() as session:
+            file_call = _single(
+                session,
+                """
+                MATCH (caller:File {path: $entry})
+                      -[r:CALLS]->
+                      (target:Function {name: 'util', path: $lib})
+                RETURN count(r) AS c, r.line_number AS line_number,
+                       r.full_call_name AS full_call_name
+                """,
+                entry=entry_path,
+                lib=lib_path,
+            )
+            assert file_call["c"] == 1
+            assert file_call["line_number"] == 3
+            assert file_call["full_call_name"] == "util"
+    finally:
+        if manager._graph is not None:
+            manager._graph.delete()
+        manager.close_driver()
+
+
+def test_v1_1_batch_chunks_across_multiple_flushes(tmp_path: Path) -> None:
+    """With ``calls_batch_size=2`` and >2 calls, every edge must still land.
+
+    Forces ``_flush_call_batches`` to issue multiple UNWIND/MERGE statements
+    during the cold-index pass (threshold-triggered mid-loop and final). If
+    the chunk slicing or buffer reset is wrong, edges go missing or duplicate.
+    """
+    fixture = tmp_path / "chunked"
+    fixture.mkdir()
+    (fixture / "lib.py").write_text(
+        "def a(x):\n    return x\n\n"
+        "def b(x):\n    return x\n\n"
+        "def c(x):\n    return x\n\n"
+        "def d(x):\n    return x\n\n"
+        "def e(x):\n    return x\n",
+        encoding="utf-8",
+    )
+    (fixture / "callers.py").write_text(
+        "from lib import a, b, c, d, e\n\n"
+        "def fan_out(n):\n"
+        "    a(n)\n"
+        "    b(n)\n"
+        "    c(n)\n"
+        "    d(n)\n"
+        "    e(n)\n",
+        encoding="utf-8",
+    )
+
+    config = Config(
+        data_dir=tmp_path,
+        falkordb_host="127.0.0.1",
+        falkordb_port=6379,
+        index_ignore=("__pycache__", ".git"),
+        calls_batch_size=2,
+    )
+    manager = _manager_or_skip(config)
+
+    try:
+        builder = GraphBuilder(config, manager, JobManager())
+        asyncio.run(builder.build_graph_from_path_async(fixture))
+
+        driver = manager.get_driver()
+        callers_path = str((fixture / "callers.py").resolve())
+        lib_path = str((fixture / "lib.py").resolve())
+
+        with driver.session() as session:
+            row = _single(
+                session,
+                """
+                MATCH (caller:Function {name: 'fan_out', path: $callers})
+                      -[r:CALLS]->
+                      (target:Function {path: $lib})
+                RETURN count(r) AS c, count(DISTINCT target.name) AS distinct_names
+                """,
+                callers=callers_path,
+                lib=lib_path,
+            )
+            assert row["c"] == 5
+            assert row["distinct_names"] == 5
+    finally:
+        if manager._graph is not None:
+            manager._graph.delete()
+        manager.close_driver()
