@@ -3,6 +3,7 @@
 import asyncio
 import os
 import pathspec
+import time
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 from datetime import datetime
@@ -135,6 +136,10 @@ class GraphBuilder:
         # _create_all_function_calls invocation, including watcher/MCP deltas.
         self._inscope_buf: list[dict] = []
         self._filescope_buf: list[dict] = []
+        # v1.2 P0.5 sub-phase accumulators for the `function_calls` phase.
+        # Populated only when Config.profile_phases is on; cleared at the
+        # start of every _create_all_function_calls invocation.
+        self._call_phase: dict[str, float] = {}
         self.create_schema()
 
     # A general schema creation based on common features across languages
@@ -582,6 +587,60 @@ class GraphBuilder:
                 # template matches (:File) by caller_path directly.
                 self._filescope_buf.append(spec)
 
+    def _emit_phase_profile(
+        self, phase_total: dict[str, float], elapsed: float, file_count: int
+    ) -> None:
+        """Print a phase-time breakdown for a cold-index pass.
+
+        Output goes straight to stderr so it shows up regardless of how the
+        host configures Python's logging level — this is an ops diagnostic,
+        not an application log line. Format: one row per phase with seconds,
+        share of total, and ms/file; a trailing row sums the unaccounted gap.
+        """
+        if not phase_total:
+            return
+        import sys as _sys
+
+        lines = ["=== cold-index phase profile ==="]
+        lines.append(f"  files indexed: {file_count}")
+        lines.append(f"  wall time:     {elapsed:.2f} s")
+        for name in (
+            "repository_node",
+            "discovery",
+            "pre_scan_imports",
+            "parse_file",
+            "add_file_to_graph",
+            "minimal_file_node",
+            "inheritance_links",
+            "function_calls",
+        ):
+            sec = phase_total.get(name, 0.0)
+            if sec == 0.0:
+                continue
+            share = (sec / elapsed * 100.0) if elapsed > 0 else 0.0
+            per_file = (sec * 1000.0 / file_count) if file_count > 0 else 0.0
+            lines.append(f"  {name:22} {sec:8.2f} s  {share:5.1f}%  {per_file:7.2f} ms/file")
+            # v1.2 P0.5 sub-rows for the function_calls phase, if instrumented.
+            if name == "function_calls" and self._call_phase:
+                fc_total = sec if sec > 0 else 1.0  # avoid /0
+                for sub in ("resolve", "flush_inscope", "flush_filescope"):
+                    sub_sec = self._call_phase.get(sub, 0.0)
+                    if sub_sec == 0.0:
+                        continue
+                    sub_share = sub_sec / fc_total * 100.0
+                    sub_per_file = (sub_sec * 1000.0 / file_count) if file_count > 0 else 0.0
+                    lines.append(
+                        f"    └─ {sub:18} {sub_sec:8.2f} s  {sub_share:5.1f}% of function_calls  {sub_per_file:7.2f} ms/file"
+                    )
+        accounted = sum(phase_total.values())
+        unaccounted = max(0.0, elapsed - accounted)
+        if elapsed > 0:
+            lines.append(
+                f"  {'unaccounted':22} {unaccounted:8.2f} s  {unaccounted / elapsed * 100.0:5.1f}%"
+            )
+        _sys.stderr.write("\n".join(lines) + "\n")
+        _sys.stderr.flush()
+
     def _flush_call_batches(self, session, *, force: bool = False) -> None:
         """Drain the CALLS-edge buffers into FalkorDB.
 
@@ -593,23 +652,34 @@ class GraphBuilder:
         (called once at the end of :meth:`_create_all_function_calls`).
         """
         chunk = self.config.calls_batch_size
+        profile = self.config.profile_phases
         while self._inscope_buf and (force or len(self._inscope_buf) >= chunk):
             head = self._inscope_buf[:chunk]
             del self._inscope_buf[:chunk]
+            _t = time.monotonic() if profile else 0.0
             try:
                 session.run(self._INSCOPE_BATCH_CYPHER, batch=head)
             except Exception as exc:
                 warning_logger(
                     f"In-scope CALLS batch flush failed (size={len(head)}): {exc}"
                 )
+            if profile:
+                self._call_phase["flush_inscope"] = (
+                    self._call_phase.get("flush_inscope", 0.0) + (time.monotonic() - _t)
+                )
         while self._filescope_buf and (force or len(self._filescope_buf) >= chunk):
             head = self._filescope_buf[:chunk]
             del self._filescope_buf[:chunk]
+            _t = time.monotonic() if profile else 0.0
             try:
                 session.run(self._FILESCOPE_BATCH_CYPHER, batch=head)
             except Exception as exc:
                 warning_logger(
                     f"File-scope CALLS batch flush failed (size={len(head)}): {exc}"
+                )
+            if profile:
+                self._call_phase["flush_filescope"] = (
+                    self._call_phase.get("flush_filescope", 0.0) + (time.monotonic() - _t)
                 )
 
     def _create_all_function_calls(self, all_file_data: list[Dict], imports_map: dict):
@@ -623,10 +693,18 @@ class GraphBuilder:
         debug_log(f"_create_all_function_calls called with {len(all_file_data)} files")
         self._inscope_buf.clear()
         self._filescope_buf.clear()
+        self._call_phase.clear()
+        profile = self.config.profile_phases
         with self.driver.session() as session:
             for idx, file_data in enumerate(all_file_data):
                 debug_log(f"Processing file {idx+1}/{len(all_file_data)}: {file_data.get('path', 'unknown')}")
+                _t_resolve = time.monotonic() if profile else 0.0
                 self._create_function_calls(file_data, imports_map)
+                if profile:
+                    self._call_phase["resolve"] = (
+                        self._call_phase.get("resolve", 0.0) + (time.monotonic() - _t_resolve)
+                    )
+                # NOTE: flush sub-timing is captured inside _flush_call_batches itself.
                 self._flush_call_batches(session, force=False)
             self._flush_call_batches(session, force=True)
 
@@ -946,14 +1024,36 @@ class GraphBuilder:
     async def build_graph_from_path_async(
         self, path: Path, is_dependency: bool = False, job_id: str = None
     ):
-        """Builds graph from a directory or file path."""
+        """Builds graph from a directory or file path.
+
+        When ``Config.profile_phases`` is set, accumulates wall-time-per-phase
+        and prints the breakdown at the end. The instrumentation is gated so
+        the default cold-index path pays no measurable cost.
+        """
+        # v1.2 P0 phase-timing scaffold — see docs/v1.2-profile.md.
+        profile = self.config.profile_phases
+        phase_total: dict[str, float] = {}
+        # Wall-time start for sanity-checking that phase sums ≈ total elapsed.
+        _t_start = time.monotonic() if profile else 0.0
+
+        def _phase_start() -> float:
+            return time.monotonic() if profile else 0.0
+
+        def _phase_end(name: str, started: float) -> None:
+            if profile:
+                phase_total[name] = phase_total.get(name, 0.0) + (time.monotonic() - started)
+
         try:
             # Tree-sitter pipeline.
             if job_id:
                 self.job_manager.update_job(job_id, status=JobStatus.RUNNING)
-            
+
+            _t = _phase_start()
             self.add_repository_to_graph(path, is_dependency)
+            _phase_end("repository_node", _t)
             repo_name = path.name
+
+            _t_discovery = _phase_start()
 
             # Search for .cgcignore upwards
             cgcignore_path = None
@@ -1036,11 +1136,15 @@ class GraphBuilder:
                         # Should not happen if ignore_root is a parent, but safety fallback
                         filtered_files.append(f)
                 files = filtered_files
+            _phase_end("discovery", _t_discovery)
+
             if job_id:
                 self.job_manager.update_job(job_id, total_files=len(files))
-            
+
             debug_log("Starting pre-scan to build imports map...")
+            _t = _phase_start()
             imports_map = self._pre_scan_for_imports(files)
+            _phase_end("pre_scan_imports", _t)
             debug_log(f"Pre-scan complete. Found {len(imports_map)} definitions.")
 
             all_file_data = []
@@ -1051,12 +1155,16 @@ class GraphBuilder:
                     if job_id:
                         self.job_manager.update_job(job_id, current_file=str(file))
                     repo_path = path.resolve() if path.is_dir() else file.parent.resolve()
+                    _t = _phase_start()
                     file_data = self.parse_file(repo_path, file, is_dependency)
+                    _phase_end("parse_file", _t)
                     # Previously only files with supported extensions were indexed.
                     # Updated to include all files so that unsupported file types
                     # can still be represented as minimal File nodes in the graph.
                     if "error" not in file_data:
+                        _t = _phase_start()
                         self.add_file_to_graph(file_data, repo_name, imports_map)
+                        _phase_end("add_file_to_graph", _t)
                         all_file_data.append(file_data)
 
                     # Previously only files with supported extensions were indexed.
@@ -1064,15 +1172,24 @@ class GraphBuilder:
                     # can still be represented as minimal File nodes in the graph.
                     else:
                         # create minimal node if parser not available
+                        _t = _phase_start()
                         self.add_minimal_file_node(file, repo_path, is_dependency)
+                        _phase_end("minimal_file_node", _t)
                     processed_count += 1
 
                     if job_id:
                         self.job_manager.update_job(job_id, processed_files=processed_count)
                     await asyncio.sleep(0.01)
 
+            _t = _phase_start()
             self._create_all_inheritance_links(all_file_data, imports_map)
+            _phase_end("inheritance_links", _t)
+            _t = _phase_start()
             self._create_all_function_calls(all_file_data, imports_map)
+            _phase_end("function_calls", _t)
+
+            if profile:
+                self._emit_phase_profile(phase_total, time.monotonic() - _t_start, len(all_file_data))
             
             if job_id:
                 self.job_manager.update_job(job_id, status=JobStatus.COMPLETED, end_time=datetime.now())

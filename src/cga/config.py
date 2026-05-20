@@ -62,6 +62,13 @@ class Config:
     via ``CGA_CALLS_BATCH_SIZE``.
     """
 
+    profile_phases: bool = False
+    """When ``True``, accumulate wall-time-per-phase metrics during cold indexing
+    and print a breakdown at the end. v1.2 P0 diagnostic — left off by default
+    because the timing reads add a small per-file cost. Override via
+    ``CGA_PROFILE_PHASES``.
+    """
+
     @classmethod
     def from_env(cls, data_dir: Path | None = None) -> "Config":
         """Build a :class:`Config` from the environment with sane defaults.
@@ -78,6 +85,7 @@ class Config:
             os.environ.get("CGA_SKIP_EXTERNAL_RESOLUTION", "false").lower() == "true"
         )
         calls_batch_size = int(os.environ.get("CGA_CALLS_BATCH_SIZE", "2000"))
+        profile_phases = os.environ.get("CGA_PROFILE_PHASES", "false").lower() == "true"
         return cls(
             data_dir=root,
             falkordb_host=host,
@@ -86,6 +94,7 @@ class Config:
             index_source=index_source,
             skip_external_resolution=skip_external_resolution,
             calls_batch_size=calls_batch_size,
+            profile_phases=profile_phases,
         )
 
     def ensure_dirs(self) -> None:
