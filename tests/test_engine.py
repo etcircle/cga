@@ -594,6 +594,53 @@ def test_v1_2_add_file_batch_chunks_across_multiple_flushes(tmp_path: Path) -> N
         manager.close_driver()
 
 
+def test_v1_2_p1b_schema_creates_callsflush_lookup_indexes(tmp_path: Path) -> None:
+    """create_schema must register the (label, property) lookup indexes the
+    CALLS flush resolves against.
+
+    Every ``OPTIONAL MATCH (n:Function {name, path})`` /
+    ``(n:Class {name, path})`` / ``(caller:File {path})`` in
+    ``_INSCOPE_BATCH_CYPHER`` and ``_FILESCOPE_BATCH_CYPHER`` keys on these.
+    Without an index FalkorDB resolves each with a full Node-By-Label-Scan,
+    which is the O(graph size) cold-index cost v1.2 P1b removes. If a future
+    change drops an index (or the ``CREATE INDEX`` form stops working), this
+    test fails instead of the regression hiding as a slow proving run.
+    """
+    config = _config(tmp_path)
+    manager = _manager_or_skip(config)
+
+    try:
+        # GraphBuilder.__init__ runs create_schema().
+        GraphBuilder(config, manager, JobManager())
+        driver = manager.get_driver()
+
+        indexed_pairs: set[tuple[str, str]] = set()
+        rows: list = []
+        with driver.session() as session:
+            for record in session.run("CALL db.indexes()"):
+                rows.append(record)
+                label = record["label"]
+                properties = record["properties"] or []
+                for prop in properties:
+                    indexed_pairs.add((label, prop))
+
+        for expected in (
+            ("Function", "name"),
+            ("Function", "path"),
+            ("Class", "name"),
+            ("Class", "path"),
+            ("File", "path"),
+        ):
+            assert expected in indexed_pairs, (
+                f"missing lookup index {expected}; "
+                f"db.indexes() rows: {[dict(r) for r in rows]}"
+            )
+    finally:
+        if manager._graph is not None:
+            manager._graph.delete()
+        manager.close_driver()
+
+
 def test_v1_1_batch_chunks_across_multiple_flushes(tmp_path: Path) -> None:
     """With ``calls_batch_size=2`` and >2 calls, every edge must still land.
 
