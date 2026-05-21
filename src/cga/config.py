@@ -62,6 +62,17 @@ class Config:
     via ``CGA_CALLS_BATCH_SIZE``.
     """
 
+    add_file_batch_size: int = 500
+    """How many indexed files to buffer before flushing the v1.2 P1a add-file batch.
+
+    v1.2 P1a applies the v1.1 buffered UNWIND/MERGE pattern to the per-file
+    Files / Functions / Classes / Modules / IMPORTS / CONTAINS / HAS_PARAMETER
+    work that ``add_file_to_graph`` was issuing one round-trip at a time. Each
+    flush expands into ~13 UNWIND queries (one per node/edge type), so a flush
+    every 500 files keeps any single UNWIND payload under a few thousand items
+    on the di-copilot proving repo. Override via ``CGA_ADD_FILE_BATCH_SIZE``.
+    """
+
     profile_phases: bool = False
     """When ``True``, accumulate wall-time-per-phase metrics during cold indexing
     and print a breakdown at the end. v1.2 P0 diagnostic — left off by default
@@ -85,6 +96,7 @@ class Config:
             os.environ.get("CGA_SKIP_EXTERNAL_RESOLUTION", "false").lower() == "true"
         )
         calls_batch_size = int(os.environ.get("CGA_CALLS_BATCH_SIZE", "2000"))
+        add_file_batch_size = int(os.environ.get("CGA_ADD_FILE_BATCH_SIZE", "500"))
         profile_phases = os.environ.get("CGA_PROFILE_PHASES", "false").lower() == "true"
         return cls(
             data_dir=root,
@@ -94,6 +106,7 @@ class Config:
             index_source=index_source,
             skip_external_resolution=skip_external_resolution,
             calls_batch_size=calls_batch_size,
+            add_file_batch_size=add_file_batch_size,
             profile_phases=profile_phases,
         )
 

@@ -281,6 +281,319 @@ def test_v1_1_batch_creates_file_scope_calls_edge(tmp_path: Path) -> None:
         manager.close_driver()
 
 
+def test_v1_2_add_file_batch_preserves_fixture_node_and_edge_counts(tmp_path: Path) -> None:
+    """Cold-index of the shared ``sample_py`` fixture produces a known graph.
+
+    The exact counts of File / Function / Class / Module / IMPORTS / CALLS /
+    INHERITS / HAS_PARAMETER nodes and edges are pinned here so any future
+    refactor of the batched add-file path that drops or duplicates a row
+    fails this test instead of producing a silently wrong graph. The numbers
+    come from running this test once against the v1.2 P1a implementation on
+    the shared ``sample_py`` fixture and locking in what the implementation
+    produces; they have to stay stable as the engine evolves.
+    """
+    config = _config(tmp_path)
+    manager = _manager_or_skip(config)
+
+    try:
+        builder = GraphBuilder(config, manager, JobManager())
+        asyncio.run(builder.build_graph_from_path_async(FIXTURE))
+
+        driver = manager.get_driver()
+        with driver.session() as session:
+            # 4 .py files (main, helper, models, duplicate) + 1 auto-created
+            # .cgcignore (which goes through add_minimal_file_node, not the
+            # batched path).
+            files_total = _single(session, "MATCH (f:File) RETURN count(f) AS c")
+            assert files_total["c"] == 5
+            py_files = _single(
+                session,
+                """
+                MATCH (f:File)
+                WHERE f.name ENDS WITH '.py'
+                RETURN count(f) AS c
+                """,
+            )
+            assert py_files["c"] == 4
+
+            # 8 Functions: duplicate.py:call_helper, main.py:{call_helper,
+            # make_child, use_math}, helper.py:{helper, extra},
+            # models.py:{base_method, child_method}. The two call_helpers
+            # are distinct nodes because (name, path, line_number) is the
+            # uniqueness key — locking this count guards against the
+            # cross-file dedup logic accidentally collapsing same-named
+            # functions into one node.
+            fn_row = _single(
+                session,
+                "MATCH (fn:Function) RETURN count(fn) AS c",
+            )
+            assert fn_row["c"] == 8
+
+            cls_row = _single(
+                session,
+                "MATCH (c:Class) RETURN count(c) AS c, collect(DISTINCT c.name) AS names",
+            )
+            assert cls_row["c"] == 2
+            assert set(cls_row["names"]) == {"Base", "Child"}
+
+            inherits_row = _single(
+                session,
+                "MATCH ()-[r:INHERITS]->() RETURN count(r) AS c",
+            )
+            assert inherits_row["c"] == 1  # Child INHERITS Base.
+
+            # CALLS: main.py:call_helper→helper.py:helper,
+            # main.py:make_child→models.py:Child (Class fall-through via
+            # COALESCE(tF, tInit, tC)), helper.py:extra→helper.py:helper,
+            # models.py:child_method→models.py:base_method (self resolution).
+            # main.py:use_math→math.sqrt is dropped because sqrt has no
+            # node in the graph (external unresolved).
+            calls_row = _single(
+                session,
+                "MATCH ()-[r:CALLS]->() RETURN count(r) AS c",
+            )
+            assert calls_row["c"] == 4
+
+            # HAS_PARAMETER: every Function has its declared args wired to
+            # Parameter nodes. 7 functions each have exactly 1 param; only
+            # make_child has zero.
+            has_param_row = _single(
+                session,
+                "MATCH ()-[r:HAS_PARAMETER]->() RETURN count(r) AS c",
+            )
+            assert has_param_row["c"] == 7
+
+            # Modules + IMPORTS: main.py is the only file with imports
+            # (math, helper, models). Loose floor — the exact set depends
+            # on whether the parser emits an entry per `from X import Y`
+            # row or one per module — but at minimum we expect the math
+            # import to materialize.
+            mod_row = _single(
+                session,
+                "MATCH (m:Module) RETURN count(m) AS c",
+            )
+            assert mod_row["c"] >= 1
+            imports_row = _single(
+                session,
+                "MATCH ()-[r:IMPORTS]->() RETURN count(r) AS c",
+            )
+            assert imports_row["c"] >= 1
+
+            # CONTAINS edges fan out across Repository, Files, and Classes
+            # with methods. Floor check rather than exact because the
+            # parsers vary in how they expose nested elements; the goal
+            # here is to catch a refactor that drops the CONTAINS payload
+            # entirely, not to pin every entry.
+            contains_row = _single(
+                session,
+                "MATCH ()-[r:CONTAINS]->() RETURN count(r) AS c",
+            )
+            assert contains_row["c"] >= 10
+    finally:
+        if manager._graph is not None:
+            manager._graph.delete()
+        manager.close_driver()
+
+
+def test_v1_2_name_only_fallback_lane_via_inscope_batch(tmp_path: Path) -> None:
+    """Promoted from /tmp/cga_smoke_batching.py case 4 (the v1.1 anti-pattern).
+
+    A Function call that doesn't resolve through imports or local scope falls
+    into the ``OPTIONAL MATCH (fbF:Function {name: item.called_name}) WHERE
+    exact IS NULL`` lane in ``_INSCOPE_BATCH_CYPHER``. If a Function with the
+    same name exists anywhere in the graph, that lane creates the CALLS edge
+    to it. v1.1 validated this in a /tmp smoke and discarded the test; v1.2
+    P1 promotes it so the lane is covered before P1b restructures the query
+    into separate exact and fallback buckets.
+    """
+    fixture = tmp_path / "fallback"
+    fixture.mkdir()
+    (fixture / "other.py").write_text(
+        "def dangling():\n    return 1\n",
+        encoding="utf-8",
+    )
+    (fixture / "caller.py").write_text(
+        "def call_dangling():\n    dangling()\n",
+        encoding="utf-8",
+    )
+
+    config = _config(tmp_path)
+    manager = _manager_or_skip(config)
+
+    try:
+        builder = GraphBuilder(config, manager, JobManager())
+        asyncio.run(builder.build_graph_from_path_async(fixture))
+
+        driver = manager.get_driver()
+        caller_path = str((fixture / "caller.py").resolve())
+        other_path = str((fixture / "other.py").resolve())
+
+        with driver.session() as session:
+            row = _single(
+                session,
+                """
+                MATCH (caller:Function {name: 'call_dangling', path: $caller})
+                      -[r:CALLS]->
+                      (target:Function {name: 'dangling', path: $other})
+                RETURN count(r) AS c, r.full_call_name AS full_call_name
+                """,
+                caller=caller_path,
+                other=other_path,
+            )
+            assert row["c"] == 1
+            assert row["full_call_name"] == "dangling"
+    finally:
+        if manager._graph is not None:
+            manager._graph.delete()
+        manager.close_driver()
+
+
+def test_v1_2_add_file_batch_chunks_across_multiple_flushes(tmp_path: Path) -> None:
+    """With ``add_file_batch_size=2`` and 5 files, every node + CONTAINS lands.
+
+    Forces ``_flush_file_batches`` to issue at least three mid-loop flushes
+    (after files 2 and 4, plus a final force at end). If the buffer slicing,
+    cross-file dedup of the directory walk, depth ordering, or per-label
+    UNWIND payload is wrong, nodes go missing or CONTAINS edges break.
+    """
+    fixture = tmp_path / "chunked_add_file"
+    fixture.mkdir()
+    sub = fixture / "subdir"
+    sub.mkdir()
+    (fixture / "a.py").write_text(
+        "def fa(x):\n    return x\nclass CA:\n    pass\n",
+        encoding="utf-8",
+    )
+    (fixture / "b.py").write_text(
+        "import os\ndef fb():\n    return os.getpid()\n",
+        encoding="utf-8",
+    )
+    (fixture / "c.py").write_text(
+        "def fc(x, y):\n    return x * y\n",
+        encoding="utf-8",
+    )
+    (sub / "d.py").write_text(
+        "def fd():\n    return 0\n",
+        encoding="utf-8",
+    )
+    (sub / "e.py").write_text(
+        "import json\ndef fe():\n    return json.dumps([])\n",
+        encoding="utf-8",
+    )
+
+    config = Config(
+        data_dir=tmp_path,
+        falkordb_host="127.0.0.1",
+        falkordb_port=6379,
+        index_ignore=("__pycache__", ".git"),
+        add_file_batch_size=2,
+    )
+    manager = _manager_or_skip(config)
+
+    try:
+        builder = GraphBuilder(config, manager, JobManager())
+        asyncio.run(builder.build_graph_from_path_async(fixture))
+
+        driver = manager.get_driver()
+        sub_path = str(sub.resolve())
+        repo_path = str(fixture.resolve())
+
+        with driver.session() as session:
+            # Every .py file materialized as a File node.
+            files_row = _single(
+                session,
+                """
+                MATCH (f:File)
+                WHERE f.name ENDS WITH '.py'
+                RETURN count(f) AS c
+                """,
+            )
+            assert files_row["c"] == 5
+
+            # Every Function landed via the batched per-label UNWIND.
+            fn_row = _single(
+                session,
+                "MATCH (fn:Function) RETURN count(fn) AS c, collect(fn.name) AS names",
+            )
+            assert fn_row["c"] == 5
+            assert set(fn_row["names"]) == {"fa", "fb", "fc", "fd", "fe"}
+
+            # Class CA landed (class without methods exercises the per-label
+            # path without the class_contains follow-up).
+            class_row = _single(
+                session,
+                "MATCH (c:Class {name: 'CA'}) RETURN count(c) AS c",
+            )
+            assert class_row["c"] == 1
+
+            # subdir Directory was deduped across d.py and e.py and CONTAINS
+            # both of them. If the depth-walk dedup is broken, this fails.
+            sub_dir_row = _single(
+                session,
+                """
+                MATCH (d:Directory {path: $subpath})-[:CONTAINS]->(f:File)
+                WHERE f.name IN ['d.py', 'e.py']
+                RETURN count(f) AS c
+                """,
+                subpath=sub_path,
+            )
+            assert sub_dir_row["c"] == 2
+
+            # Repository CONTAINS the three root .py files and the subdir.
+            # (The auto-created .cgcignore is also under Repository but goes
+            #  through add_minimal_file_node, not the batched path — counted
+            #  separately so the assertion doesn't depend on that path.)
+            top_py_row = _single(
+                session,
+                """
+                MATCH (r:Repository {path: $repo})-[:CONTAINS]->(f:File)
+                WHERE f.name ENDS WITH '.py'
+                RETURN count(f) AS c
+                """,
+                repo=repo_path,
+            )
+            assert top_py_row["c"] == 3  # a.py, b.py, c.py
+            top_subdir_row = _single(
+                session,
+                """
+                MATCH (r:Repository {path: $repo})-[:CONTAINS]->(d:Directory)
+                RETURN count(d) AS c
+                """,
+                repo=repo_path,
+            )
+            assert top_subdir_row["c"] == 1
+
+            # IMPORTS edges land for both files that import (os from b.py,
+            # json from e.py). If the per-language imports buffer split is
+            # wrong, one of these vanishes.
+            imports_row = _single(
+                session,
+                """
+                MATCH (:File)-[r:IMPORTS]->(m:Module)
+                WHERE m.name IN ['os', 'json']
+                RETURN count(r) AS c, collect(DISTINCT m.name) AS mods
+                """,
+            )
+            assert imports_row["c"] == 2
+            assert set(imports_row["mods"]) == {"os", "json"}
+
+            # HAS_PARAMETER edges land for fc(x, y) via the batched
+            # parameters query.
+            param_row = _single(
+                session,
+                """
+                MATCH (fn:Function {name: 'fc'})-[:HAS_PARAMETER]->(p:Parameter)
+                RETURN count(p) AS c, collect(p.name) AS names
+                """,
+            )
+            assert param_row["c"] == 2
+            assert set(param_row["names"]) == {"x", "y"}
+    finally:
+        if manager._graph is not None:
+            manager._graph.delete()
+        manager.close_driver()
+
+
 def test_v1_1_batch_chunks_across_multiple_flushes(tmp_path: Path) -> None:
     """With ``calls_batch_size=2`` and >2 calls, every edge must still land.
 
