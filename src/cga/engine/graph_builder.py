@@ -140,6 +140,12 @@ class GraphBuilder:
         # Populated only when Config.profile_phases is on; cleared at the
         # start of every _create_all_function_calls invocation.
         self._call_phase: dict[str, float] = {}
+        # v1.2 P1a — cross-file buffers for the add-file phase. Cleared at the
+        # start of build_graph_from_path_async's cold-index loop; the single-
+        # file callers (update_file_in_graph, MCP _index_one_file) stay on the
+        # legacy per-file add_file_to_graph path and never touch these.
+        self._file_batch_buf: dict[str, list[dict]] = {}
+        self._file_batch_dir_seen: set[tuple[str, str]] = set()
         self.create_schema()
 
     # A general schema creation based on common features across languages
@@ -423,6 +429,329 @@ class GraphBuilder:
             # Class inheritance is handled in a separate pass after all files are processed.
             # Function calls are also handled in a separate pass after all files are processed.
 
+    # v1.2 P1a — buffered batch path for the cold-index loop.
+    #
+    # ``add_file_to_graph`` above stays the per-file impl for the single-file
+    # callers (``update_file_in_graph`` watcher delta, MCP ``_index_one_file``).
+    # ``build_graph_from_path_async`` skips that method entirely on the
+    # cold-index path and routes through ``_buffer_file_for_batch`` +
+    # ``_flush_file_batches`` instead. Each per-file MERGE that was a separate
+    # round-trip in v1.0 becomes one row in a cross-file UNWIND/MERGE payload.
+
+    _FILE_BATCH_KEYS = (
+        "files",
+        "dirs",
+        "file_contains_repo",
+        "file_contains_dir",
+        "functions",
+        "classes",
+        "variables",
+        "interfaces",
+        "parameters",
+        "modules",
+        "nested_functions",
+        "class_contains",
+        "imports_python",
+        "imports_javascript",
+    )
+
+    def _clear_file_batch_buffers(self) -> None:
+        """Drop everything in the v1.2 P1a batch state. Called at cold-index entry."""
+        self._file_batch_buf = {key: [] for key in self._FILE_BATCH_KEYS}
+        self._file_batch_dir_seen.clear()
+
+    def _buffer_file_for_batch(self, file_data: Dict) -> None:
+        """Translate one parsed file into rows for the v1.2 P1a flush buffers.
+
+        Pure Python; no DB round-trips. Mirrors :meth:`add_file_to_graph`'s
+        node/edge set row-for-row so the batched flush produces a byte-identical
+        graph to the per-file path. The Repository node is assumed to exist
+        (created at the start of :meth:`build_graph_from_path_async`), so the
+        defensive Repository MATCH the per-file path runs is dropped here.
+        """
+        file_path_str = str(Path(file_data["path"]).resolve())
+        file_name = Path(file_path_str).name
+        is_dependency = file_data.get("is_dependency", False)
+        repo_path_obj = Path(file_data["repo_path"]).resolve()
+
+        try:
+            relative_path = str(Path(file_path_str).relative_to(repo_path_obj))
+        except ValueError:
+            relative_path = file_name
+
+        buf = self._file_batch_buf
+        buf["files"].append({
+            "path": file_path_str,
+            "name": file_name,
+            "relative_path": relative_path,
+            "is_dependency": is_dependency,
+        })
+
+        file_path_obj = Path(file_path_str)
+        try:
+            relative_path_to_file = file_path_obj.relative_to(repo_path_obj)
+        except ValueError:
+            relative_path_to_file = Path(file_name)
+
+        parent_path = str(repo_path_obj)
+        parent_label = "Repository"
+        for depth, part in enumerate(relative_path_to_file.parts[:-1]):
+            current_path = str(Path(parent_path) / part)
+            key = (parent_path, current_path)
+            if key not in self._file_batch_dir_seen:
+                self._file_batch_dir_seen.add(key)
+                buf["dirs"].append({
+                    "parent_path": parent_path,
+                    "parent_label": parent_label,
+                    "current_path": current_path,
+                    "part": part,
+                    "depth": depth,
+                })
+            parent_path = current_path
+            parent_label = "Directory"
+
+        # Immediate parent of the file: either Repository (file at root) or
+        # Directory (file under one or more subdirs).
+        bucket = "file_contains_repo" if parent_label == "Repository" else "file_contains_dir"
+        buf[bucket].append({"parent_path": parent_path, "file_path": file_path_str})
+
+        item_mappings = [
+            (file_data.get("functions", []), "functions", "Function"),
+            (file_data.get("classes", []), "classes", "Class"),
+            (file_data.get("variables", []), "variables", "Variable"),
+            (file_data.get("interfaces", []), "interfaces", "Interface"),
+        ]
+        for items, bucket_key, label in item_mappings:
+            for item in items:
+                item_props = dict(item)
+                if label == "Function" and "cyclomatic_complexity" not in item_props:
+                    item_props["cyclomatic_complexity"] = 1
+                buf[bucket_key].append({
+                    "path": file_path_str,
+                    "name": item["name"],
+                    "line_number": item["line_number"],
+                    "props": item_props,
+                })
+
+        for func in file_data.get("functions", []):
+            for arg_name in func.get("args", []):
+                buf["parameters"].append({
+                    "path": file_path_str,
+                    "func_name": func["name"],
+                    "func_line": func["line_number"],
+                    "arg_name": arg_name,
+                })
+
+        lang = file_data.get("lang")
+        for mod in file_data.get("modules", []):
+            if mod.get("name"):
+                buf["modules"].append({"name": mod["name"], "lang": lang})
+
+        for item in file_data.get("functions", []):
+            if item.get("context_type") == "function_definition" and item.get("context"):
+                buf["nested_functions"].append({
+                    "path": file_path_str,
+                    "context": item["context"],
+                    "name": item["name"],
+                    "line_number": item["line_number"],
+                })
+
+        for func in file_data.get("functions", []):
+            if func.get("class_context"):
+                buf["class_contains"].append({
+                    "path": file_path_str,
+                    "class_name": func["class_context"],
+                    "func_name": func["name"],
+                    "func_line": func["line_number"],
+                })
+
+        if lang == "javascript":
+            for imp in file_data.get("imports", []):
+                module_name = imp.get("source")
+                if not module_name:
+                    continue
+                rel_props = {"imported_name": imp.get("name", "*")}
+                if imp.get("alias"):
+                    rel_props["alias"] = imp.get("alias")
+                if imp.get("line_number"):
+                    rel_props["line_number"] = imp.get("line_number")
+                buf["imports_javascript"].append({
+                    "path": file_path_str,
+                    "module_name": module_name,
+                    "rel_props": rel_props,
+                })
+        else:
+            for imp in file_data.get("imports", []):
+                rel_props: dict = {}
+                if imp.get("line_number"):
+                    rel_props["line_number"] = imp.get("line_number")
+                if imp.get("alias"):
+                    rel_props["alias"] = imp.get("alias")
+                buf["imports_python"].append({
+                    "path": file_path_str,
+                    "module_name": imp.get("name"),
+                    "full_import_name": imp.get("full_import_name"),
+                    "rel_props": rel_props,
+                })
+
+    def _flush_file_batches(self, session) -> None:
+        """Drain every v1.2 P1a buffer in dependency order, then clear them.
+
+        Order matters: File nodes come first (later steps MATCH them); Directory
+        MERGEs go depth-first (depth N MATCHes the depth N-1 nodes the previous
+        round just created); per-label CONTAINS waits until Files exist;
+        parameters/nested-functions/class-contains wait until Functions exist.
+        Repository was MERGE'd at the start of build_graph_from_path_async.
+        """
+        if not self._file_batch_buf:
+            return
+
+        buf = self._file_batch_buf
+
+        if buf["files"]:
+            session.run(
+                """
+                UNWIND $files AS f
+                MERGE (file:File {path: f.path})
+                SET file.name = f.name,
+                    file.relative_path = f.relative_path,
+                    file.is_dependency = f.is_dependency
+                """,
+                files=buf["files"],
+            )
+
+        if buf["dirs"]:
+            by_depth: dict[int, list[dict]] = {}
+            for d in buf["dirs"]:
+                by_depth.setdefault(d["depth"], []).append(d)
+            for depth in sorted(by_depth):
+                items = by_depth[depth]
+                # All rows at the same depth share the same parent_label: depth
+                # 0 lives under Repository, depth >0 under Directory. The
+                # per-file walk in _buffer_file_for_batch enforces that.
+                parent_label = items[0]["parent_label"]
+                session.run(
+                    f"""
+                    UNWIND $items AS d
+                    MATCH (p:{parent_label} {{path: d.parent_path}})
+                    MERGE (c:Directory {{path: d.current_path}})
+                    SET c.name = d.part
+                    MERGE (p)-[:CONTAINS]->(c)
+                    """,
+                    items=items,
+                )
+
+        if buf["file_contains_repo"]:
+            session.run(
+                """
+                UNWIND $items AS i
+                MATCH (p:Repository {path: i.parent_path})
+                MATCH (f:File {path: i.file_path})
+                MERGE (p)-[:CONTAINS]->(f)
+                """,
+                items=buf["file_contains_repo"],
+            )
+        if buf["file_contains_dir"]:
+            session.run(
+                """
+                UNWIND $items AS i
+                MATCH (p:Directory {path: i.parent_path})
+                MATCH (f:File {path: i.file_path})
+                MERGE (p)-[:CONTAINS]->(f)
+                """,
+                items=buf["file_contains_dir"],
+            )
+
+        for bucket_key, label in (
+            ("functions", "Function"),
+            ("classes", "Class"),
+            ("variables", "Variable"),
+            ("interfaces", "Interface"),
+        ):
+            if buf[bucket_key]:
+                session.run(
+                    f"""
+                    UNWIND $items AS item
+                    MATCH (f:File {{path: item.path}})
+                    MERGE (n:{label} {{name: item.name, path: item.path, line_number: item.line_number}})
+                    SET n += item.props
+                    MERGE (f)-[:CONTAINS]->(n)
+                    """,
+                    items=buf[bucket_key],
+                )
+
+        if buf["parameters"]:
+            session.run(
+                """
+                UNWIND $items AS p
+                MATCH (fn:Function {name: p.func_name, path: p.path, line_number: p.func_line})
+                MERGE (param:Parameter {name: p.arg_name, path: p.path, function_line_number: p.func_line})
+                MERGE (fn)-[:HAS_PARAMETER]->(param)
+                """,
+                items=buf["parameters"],
+            )
+
+        if buf["modules"]:
+            session.run(
+                """
+                UNWIND $items AS m
+                MERGE (mod:Module {name: m.name})
+                ON CREATE SET mod.lang = m.lang
+                ON MATCH SET mod.lang = coalesce(mod.lang, m.lang)
+                """,
+                items=buf["modules"],
+            )
+
+        if buf["nested_functions"]:
+            session.run(
+                """
+                UNWIND $items AS r
+                MATCH (outer:Function {name: r.context, path: r.path})
+                MATCH (inner:Function {name: r.name, path: r.path, line_number: r.line_number})
+                MERGE (outer)-[:CONTAINS]->(inner)
+                """,
+                items=buf["nested_functions"],
+            )
+
+        if buf["imports_javascript"]:
+            session.run(
+                """
+                UNWIND $items AS i
+                MATCH (f:File {path: i.path})
+                MERGE (m:Module {name: i.module_name})
+                MERGE (f)-[r:IMPORTS]->(m)
+                SET r += i.rel_props
+                """,
+                items=buf["imports_javascript"],
+            )
+
+        if buf["imports_python"]:
+            session.run(
+                """
+                UNWIND $items AS i
+                MATCH (f:File {path: i.path})
+                WITH f, i WHERE i.module_name IS NOT NULL
+                MERGE (m:Module {name: i.module_name})
+                SET m.full_import_name = coalesce(i.full_import_name, m.full_import_name)
+                MERGE (f)-[r:IMPORTS]->(m)
+                SET r += i.rel_props
+                """,
+                items=buf["imports_python"],
+            )
+
+        if buf["class_contains"]:
+            session.run(
+                """
+                UNWIND $items AS r
+                MATCH (c:Class {name: r.class_name, path: r.path})
+                MATCH (fn:Function {name: r.func_name, path: r.path, line_number: r.func_line})
+                MERGE (c)-[:CONTAINS]->(fn)
+                """,
+                items=buf["class_contains"],
+            )
+
+        self._clear_file_batch_buffers()
+
     # Second pass to create relationships that depend on all files being present like call functions and class inheritance
     def _safe_run_create(self, session, query, params) -> bool:
         """Run a creation query and return whether it created/matched rows."""
@@ -641,7 +970,9 @@ class GraphBuilder:
         _sys.stderr.write("\n".join(lines) + "\n")
         _sys.stderr.flush()
 
-    def _flush_call_batches(self, session, *, force: bool = False) -> None:
+    def _flush_call_batches(
+        self, session, *, force: bool = False, is_cold_index: bool = False
+    ) -> None:
         """Drain the CALLS-edge buffers into FalkorDB.
 
         Each bucket is flushed in chunks of ``Config.calls_batch_size`` via a
@@ -650,6 +981,14 @@ class GraphBuilder:
         between files during cold indexing to bound memory); ``force=True``
         drains everything that remains, including a partial last chunk
         (called once at the end of :meth:`_create_all_function_calls`).
+
+        ``is_cold_index`` controls the failure mode (v1.1 carry-over follow-up
+        #2). On the cold path a chunk failure silently drops up to
+        ``calls_batch_size`` CALLS edges, which is the exact kind of
+        correctness loss the byte-parity gate is meant to catch — so re-raise
+        and let the cold-index pass fail loudly. The watcher delta path keeps
+        the warn-and-continue behavior so a single bad chunk does not knock
+        the watcher out of service.
         """
         chunk = self.config.calls_batch_size
         profile = self.config.profile_phases
@@ -660,6 +999,8 @@ class GraphBuilder:
             try:
                 session.run(self._INSCOPE_BATCH_CYPHER, batch=head)
             except Exception as exc:
+                if is_cold_index:
+                    raise
                 warning_logger(
                     f"In-scope CALLS batch flush failed (size={len(head)}): {exc}"
                 )
@@ -674,6 +1015,8 @@ class GraphBuilder:
             try:
                 session.run(self._FILESCOPE_BATCH_CYPHER, batch=head)
             except Exception as exc:
+                if is_cold_index:
+                    raise
                 warning_logger(
                     f"File-scope CALLS batch flush failed (size={len(head)}): {exc}"
                 )
@@ -682,7 +1025,13 @@ class GraphBuilder:
                     self._call_phase.get("flush_filescope", 0.0) + (time.monotonic() - _t)
                 )
 
-    def _create_all_function_calls(self, all_file_data: list[Dict], imports_map: dict):
+    def _create_all_function_calls(
+        self,
+        all_file_data: list[Dict],
+        imports_map: dict,
+        *,
+        is_cold_index: bool = False,
+    ):
         """Create CALLS relationships for all functions after all files have been processed.
 
         Two-phase: per-file resolution + threshold flush, then a final force
@@ -705,8 +1054,8 @@ class GraphBuilder:
                         self._call_phase.get("resolve", 0.0) + (time.monotonic() - _t_resolve)
                     )
                 # NOTE: flush sub-timing is captured inside _flush_call_batches itself.
-                self._flush_call_batches(session, force=False)
-            self._flush_call_batches(session, force=True)
+                self._flush_call_batches(session, force=False, is_cold_index=is_cold_index)
+            self._flush_call_batches(session, force=True, is_cold_index=is_cold_index)
 
     def _create_inheritance_links(self, session, file_data: Dict, imports_map: dict):
         """Create INHERITS relationships with a more robust resolution logic."""
@@ -1051,7 +1400,10 @@ class GraphBuilder:
             _t = _phase_start()
             self.add_repository_to_graph(path, is_dependency)
             _phase_end("repository_node", _t)
-            repo_name = path.name
+            # v1.2 P1a: the cold-index loop no longer calls add_file_to_graph
+            # per-file (which used to take repo_name), so the local repo_name
+            # binding the old code held here is gone with it. The single-file
+            # callers compute it themselves from repo_path.name.
 
             _t_discovery = _phase_start()
 
@@ -1149,43 +1501,72 @@ class GraphBuilder:
 
             all_file_data = []
 
+            # v1.2 P1a — buffered add-file batch state for the cold-index loop.
+            # Cleared here so prior cold-index runs on the same GraphBuilder
+            # instance can't leak rows; the single-file callers
+            # (update_file_in_graph, MCP _index_one_file) never touch this
+            # buffer because they call add_file_to_graph directly.
+            self._clear_file_batch_buffers()
+            add_file_batch_size = self.config.add_file_batch_size
+            pending_in_batch = 0
+
             processed_count = 0
-            for file in files:
-                if file.is_file():
-                    if job_id:
-                        self.job_manager.update_job(job_id, current_file=str(file))
-                    repo_path = path.resolve() if path.is_dir() else file.parent.resolve()
+            with self.driver.session() as add_file_session:
+                for file in files:
+                    if file.is_file():
+                        if job_id:
+                            self.job_manager.update_job(job_id, current_file=str(file))
+                        repo_path = path.resolve() if path.is_dir() else file.parent.resolve()
+                        _t = _phase_start()
+                        file_data = self.parse_file(repo_path, file, is_dependency)
+                        _phase_end("parse_file", _t)
+                        # Previously only files with supported extensions were indexed.
+                        # Updated to include all files so that unsupported file types
+                        # can still be represented as minimal File nodes in the graph.
+                        if "error" not in file_data:
+                            _t = _phase_start()
+                            self._buffer_file_for_batch(file_data)
+                            pending_in_batch += 1
+                            if pending_in_batch >= add_file_batch_size:
+                                self._flush_file_batches(add_file_session)
+                                pending_in_batch = 0
+                            _phase_end("add_file_to_graph", _t)
+                            all_file_data.append(file_data)
+
+                        # Previously only files with supported extensions were indexed.
+                        # Updated to include all files so that unsupported file types
+                        # can still be represented as minimal File nodes in the graph.
+                        else:
+                            # create minimal node if parser not available
+                            _t = _phase_start()
+                            self.add_minimal_file_node(file, repo_path, is_dependency)
+                            _phase_end("minimal_file_node", _t)
+                        processed_count += 1
+
+                        if job_id:
+                            self.job_manager.update_job(job_id, processed_files=processed_count)
+                        # v1.2 P1a — drop the 10 ms event-loop yield on the
+                        # cold path (v1.1 carry-over follow-up #4). 0 still
+                        # gives other tasks a chance to run without burning
+                        # ~11 % of cgc-fork wall time in pure sleep.
+                        await asyncio.sleep(0)
+
+                # Final force flush — drain whatever is left in the partial
+                # last batch before downstream phases (inheritance, calls)
+                # MATCH the File / Function / Class nodes they depend on.
+                if pending_in_batch > 0:
                     _t = _phase_start()
-                    file_data = self.parse_file(repo_path, file, is_dependency)
-                    _phase_end("parse_file", _t)
-                    # Previously only files with supported extensions were indexed.
-                    # Updated to include all files so that unsupported file types
-                    # can still be represented as minimal File nodes in the graph.
-                    if "error" not in file_data:
-                        _t = _phase_start()
-                        self.add_file_to_graph(file_data, repo_name, imports_map)
-                        _phase_end("add_file_to_graph", _t)
-                        all_file_data.append(file_data)
-
-                    # Previously only files with supported extensions were indexed.
-                    # Updated to include all files so that unsupported file types
-                    # can still be represented as minimal File nodes in the graph.
-                    else:
-                        # create minimal node if parser not available
-                        _t = _phase_start()
-                        self.add_minimal_file_node(file, repo_path, is_dependency)
-                        _phase_end("minimal_file_node", _t)
-                    processed_count += 1
-
-                    if job_id:
-                        self.job_manager.update_job(job_id, processed_files=processed_count)
-                    await asyncio.sleep(0.01)
+                    self._flush_file_batches(add_file_session)
+                    pending_in_batch = 0
+                    _phase_end("add_file_to_graph", _t)
 
             _t = _phase_start()
             self._create_all_inheritance_links(all_file_data, imports_map)
             _phase_end("inheritance_links", _t)
             _t = _phase_start()
-            self._create_all_function_calls(all_file_data, imports_map)
+            self._create_all_function_calls(
+                all_file_data, imports_map, is_cold_index=True
+            )
             _phase_end("function_calls", _t)
 
             if profile:
