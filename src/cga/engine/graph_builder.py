@@ -148,34 +148,100 @@ class GraphBuilder:
         self._file_batch_dir_seen: set[tuple[str, str]] = set()
         self.create_schema()
 
+    # Intended uniqueness keys, one per node label, in Neo4j `CREATE
+    # CONSTRAINT` syntax. CGA's FalkorDB session wrapper rewrites these in
+    # `database.py::_translate_schema_query`, and the rewrite — not the
+    # constraint — is what matters for v1.2 P1b:
+    #   * composite-key constraints (Function / Class / Interface / Variable
+    #     / Parameter) are DOWNGRADED to a composite `CREATE INDEX` on
+    #     (name, path, ...). That index is what backs every `(name, path)`
+    #     and name-only `OPTIONAL MATCH` in the CALLS flush — FalkorDB uses a
+    #     leading-column prefix of the composite index for those lookups.
+    #   * single-key constraints (Repository / File / Directory / Module)
+    #     are rewritten to `CREATE CONSTRAINT ON ... ASSERT`, which FalkorDB
+    #     still rejects — they create nothing.
+    # Neither path enforces uniqueness; engine writes MERGE on the full key,
+    # so duplicates do not arise. Porting to FalkorDB `GRAPH.CONSTRAINT`
+    # (real enforcement) is tracked as a v1.2 P1b follow-up.
+    _SCHEMA_CONSTRAINTS = (
+        "CREATE CONSTRAINT repository_path IF NOT EXISTS FOR (r:Repository) REQUIRE r.path IS UNIQUE",
+        "CREATE CONSTRAINT path IF NOT EXISTS FOR (f:File) REQUIRE f.path IS UNIQUE",
+        "CREATE CONSTRAINT directory_path IF NOT EXISTS FOR (d:Directory) REQUIRE d.path IS UNIQUE",
+        "CREATE CONSTRAINT function_unique IF NOT EXISTS FOR (f:Function) REQUIRE (f.name, f.path, f.line_number) IS UNIQUE",
+        "CREATE CONSTRAINT class_unique IF NOT EXISTS FOR (c:Class) REQUIRE (c.name, c.path, c.line_number) IS UNIQUE",
+        "CREATE CONSTRAINT interface_unique IF NOT EXISTS FOR (i:Interface) REQUIRE (i.name, i.path, i.line_number) IS UNIQUE",
+        "CREATE CONSTRAINT variable_unique IF NOT EXISTS FOR (v:Variable) REQUIRE (v.name, v.path, v.line_number) IS UNIQUE",
+        "CREATE CONSTRAINT module_name IF NOT EXISTS FOR (m:Module) REQUIRE m.name IS UNIQUE",
+        "CREATE CONSTRAINT parameter_unique IF NOT EXISTS FOR (p:Parameter) REQUIRE (p.name, p.path, p.function_line_number) IS UNIQUE",
+    )
+
+    # v1.2 P1b — range indexes created explicitly.
+    #   * file_path — the file-scope CALLS flush resolves callers with
+    #     `OPTIONAL MATCH (caller:File {path})`. File's constraint is
+    #     single-key, so (per the note above) it creates nothing — File is
+    #     the one CALLS-flush label that needs an explicit index.
+    #   * function_lang / class_lang — pre-v1.2 language-filter indexes;
+    #     listed here only because the old single-try block never reached
+    #     them either (the first constraint failure aborted the whole block).
+    # Function / Class (name, path) are NOT listed: they are already indexed
+    # via the composite-constraint downgrade above. An explicit
+    # `CREATE INDEX ... ON (f.name)` would be rejected as "already indexed".
+    _SCHEMA_INDEXES = (
+        "CREATE INDEX file_path IF NOT EXISTS FOR (f:File) ON (f.path)",
+        "CREATE INDEX function_lang IF NOT EXISTS FOR (f:Function) ON (f.lang)",
+        "CREATE INDEX class_lang IF NOT EXISTS FOR (c:Class) ON (c.lang)",
+    )
+
+    # Pre-v1.2 full-text index. `_translate_schema_query` rewrites
+    # `CREATE FULLTEXT INDEX` to a `RETURN 1` no-op — FalkorDB full-text
+    # indexes are not wired up through the wrapper, so this currently
+    # creates nothing. Kept verbatim; wiring it up is out of P1b scope.
+    _SCHEMA_FULLTEXT_INDEX = """
+        CREATE FULLTEXT INDEX code_search_index IF NOT EXISTS
+        FOR (n:Function|Class|Variable)
+        ON EACH [n.name, n.source, n.docstring]
+    """
+
     # A general schema creation based on common features across languages
     def create_schema(self):
-        """Create constraints and indexes in Neo4j."""
-        # When adding a new node type with a unique key, add its constraint here.
+        """Create constraints and indexes in the graph store.
+
+        Each statement runs in its own ``try`` (v1.2 P1b). The previous code
+        wrapped every statement in a single ``try`` block — so the first
+        ``CREATE CONSTRAINT`` (single-key, rewritten to a form FalkorDB
+        rejects) raised and skipped *every* statement after it, including the
+        composite-constraint downgrades and the explicit indexes the CALLS
+        flush depends on. The engine had been running with no indexes at all.
+        """
         with self.driver.session() as session:
+            # Constraints: see _SCHEMA_CONSTRAINTS. The composite-key ones are
+            # downgraded to indexes and succeed; the single-key ones are
+            # rejected. Isolate each so a rejection cannot abort the rest.
+            constraint_failures = 0
+            for statement in self._SCHEMA_CONSTRAINTS:
+                try:
+                    session.run(statement)
+                except Exception:
+                    constraint_failures += 1
+            if constraint_failures:
+                warning_logger(
+                    f"{constraint_failures}/{len(self._SCHEMA_CONSTRAINTS)} CREATE "
+                    "CONSTRAINT statements rejected by FalkorDB (single-key "
+                    "constraints); see create_schema. Uniqueness relies on MERGE keys"
+                )
+
+            for statement in self._SCHEMA_INDEXES:
+                try:
+                    session.run(statement)
+                except Exception as exc:
+                    warning_logger(f"Schema index not created ({statement.split()[2]}): {exc}")
+
             try:
-                session.run("CREATE CONSTRAINT repository_path IF NOT EXISTS FOR (r:Repository) REQUIRE r.path IS UNIQUE")
-                session.run("CREATE CONSTRAINT path IF NOT EXISTS FOR (f:File) REQUIRE f.path IS UNIQUE")
-                session.run("CREATE CONSTRAINT directory_path IF NOT EXISTS FOR (d:Directory) REQUIRE d.path IS UNIQUE")
-                session.run("CREATE CONSTRAINT function_unique IF NOT EXISTS FOR (f:Function) REQUIRE (f.name, f.path, f.line_number) IS UNIQUE")
-                session.run("CREATE CONSTRAINT class_unique IF NOT EXISTS FOR (c:Class) REQUIRE (c.name, c.path, c.line_number) IS UNIQUE")
-                session.run("CREATE CONSTRAINT interface_unique IF NOT EXISTS FOR (i:Interface) REQUIRE (i.name, i.path, i.line_number) IS UNIQUE")
-                session.run("CREATE CONSTRAINT variable_unique IF NOT EXISTS FOR (v:Variable) REQUIRE (v.name, v.path, v.line_number) IS UNIQUE")
-                session.run("CREATE CONSTRAINT module_name IF NOT EXISTS FOR (m:Module) REQUIRE m.name IS UNIQUE")
-                session.run("CREATE CONSTRAINT parameter_unique IF NOT EXISTS FOR (p:Parameter) REQUIRE (p.name, p.path, p.function_line_number) IS UNIQUE")
-                
-                # Indexes for language attribute
-                session.run("CREATE INDEX function_lang IF NOT EXISTS FOR (f:Function) ON (f.lang)")
-                session.run("CREATE INDEX class_lang IF NOT EXISTS FOR (c:Class) ON (c.lang)")
-                session.run("""
-                    CREATE FULLTEXT INDEX code_search_index IF NOT EXISTS
-                    FOR (n:Function|Class|Variable)
-                    ON EACH [n.name, n.source, n.docstring]
-                """)
-                
-                info_logger("Database schema verified/created successfully")
-            except Exception as e:
-                warning_logger(f"Schema creation warning: {e}")
+                session.run(self._SCHEMA_FULLTEXT_INDEX)
+            except Exception as exc:
+                warning_logger(f"Full-text index code_search_index not created: {exc}")
+
+            info_logger("Database schema verified/created successfully")
 
 
     def _pre_scan_for_imports(self, files: list[Path]) -> dict:
