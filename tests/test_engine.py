@@ -595,16 +595,19 @@ def test_v1_2_add_file_batch_chunks_across_multiple_flushes(tmp_path: Path) -> N
 
 
 def test_v1_2_p1b_schema_creates_callsflush_lookup_indexes(tmp_path: Path) -> None:
-    """create_schema must register the (label, property) lookup indexes the
-    CALLS flush resolves against.
+    """create_schema must leave the CALLS flush's lookup keys range-indexed.
 
     Every ``OPTIONAL MATCH (n:Function {name, path})`` /
     ``(n:Class {name, path})`` / ``(caller:File {path})`` in
     ``_INSCOPE_BATCH_CYPHER`` and ``_FILESCOPE_BATCH_CYPHER`` keys on these.
     Without an index FalkorDB resolves each with a full Node-By-Label-Scan,
-    which is the O(graph size) cold-index cost v1.2 P1b removes. If a future
-    change drops an index (or the ``CREATE INDEX`` form stops working), this
-    test fails instead of the regression hiding as a slow proving run.
+    the O(graph size) cold-index cost v1.2 P1b removes.
+
+    This asserts the OUTCOME, not the mechanism: Function/Class are indexed
+    via the composite-constraint downgrade, File via an explicit
+    ``CREATE INDEX`` (see ``create_schema``). If either path breaks — a
+    dropped index, a single-try regression, a translation-layer change —
+    this test fails instead of the regression hiding as a slow proving run.
     """
     config = _config(tmp_path)
     manager = _manager_or_skip(config)

@@ -148,12 +148,21 @@ class GraphBuilder:
         self._file_batch_dir_seen: set[tuple[str, str]] = set()
         self.create_schema()
 
-    # Intended uniqueness keys, one per node label. These use Neo4j
-    # `CREATE CONSTRAINT` syntax, which FalkorDB rejects ("Invalid constraint
-    # command, use the GRAPH.CONSTRAINT command instead"). They have never
-    # succeeded — kept as a record of intent until ported to FalkorDB's
-    # GRAPH.CONSTRAINT form (tracked as a v1.2 P1b follow-up). Engine writes
-    # MERGE on the full key, so duplicates do not arise without enforcement.
+    # Intended uniqueness keys, one per node label, in Neo4j `CREATE
+    # CONSTRAINT` syntax. CGA's FalkorDB session wrapper rewrites these in
+    # `database.py::_translate_schema_query`, and the rewrite — not the
+    # constraint — is what matters for v1.2 P1b:
+    #   * composite-key constraints (Function / Class / Interface / Variable
+    #     / Parameter) are DOWNGRADED to a composite `CREATE INDEX` on
+    #     (name, path, ...). That index is what backs every `(name, path)`
+    #     and name-only `OPTIONAL MATCH` in the CALLS flush — FalkorDB uses a
+    #     leading-column prefix of the composite index for those lookups.
+    #   * single-key constraints (Repository / File / Directory / Module)
+    #     are rewritten to `CREATE CONSTRAINT ON ... ASSERT`, which FalkorDB
+    #     still rejects — they create nothing.
+    # Neither path enforces uniqueness; engine writes MERGE on the full key,
+    # so duplicates do not arise. Porting to FalkorDB `GRAPH.CONSTRAINT`
+    # (real enforcement) is tracked as a v1.2 P1b follow-up.
     _SCHEMA_CONSTRAINTS = (
         "CREATE CONSTRAINT repository_path IF NOT EXISTS FOR (r:Repository) REQUIRE r.path IS UNIQUE",
         "CREATE CONSTRAINT path IF NOT EXISTS FOR (f:File) REQUIRE f.path IS UNIQUE",
@@ -166,22 +175,27 @@ class GraphBuilder:
         "CREATE CONSTRAINT parameter_unique IF NOT EXISTS FOR (p:Parameter) REQUIRE (p.name, p.path, p.function_line_number) IS UNIQUE",
     )
 
-    # v1.2 P1b — range indexes. The first five back the (name, path) lookups
-    # every OPTIONAL MATCH in _INSCOPE_BATCH_CYPHER / _FILESCOPE_BATCH_CYPHER
-    # (and the add-file MERGEs) keys on; without them FalkorDB resolves each
-    # with a full Node-By-Label-Scan, O(graph size) per call site — the
-    # dominant cold-index cost the v1.2 P0.5 profile surfaced. The two *_lang
-    # indexes are pre-v1.2 and were never reached before (see create_schema).
+    # v1.2 P1b — range indexes created explicitly.
+    #   * file_path — the file-scope CALLS flush resolves callers with
+    #     `OPTIONAL MATCH (caller:File {path})`. File's constraint is
+    #     single-key, so (per the note above) it creates nothing — File is
+    #     the one CALLS-flush label that needs an explicit index.
+    #   * function_lang / class_lang — pre-v1.2 language-filter indexes;
+    #     listed here only because the old single-try block never reached
+    #     them either (the first constraint failure aborted the whole block).
+    # Function / Class (name, path) are NOT listed: they are already indexed
+    # via the composite-constraint downgrade above. An explicit
+    # `CREATE INDEX ... ON (f.name)` would be rejected as "already indexed".
     _SCHEMA_INDEXES = (
-        "CREATE INDEX function_name IF NOT EXISTS FOR (f:Function) ON (f.name)",
-        "CREATE INDEX function_path IF NOT EXISTS FOR (f:Function) ON (f.path)",
-        "CREATE INDEX class_name IF NOT EXISTS FOR (c:Class) ON (c.name)",
-        "CREATE INDEX class_path IF NOT EXISTS FOR (c:Class) ON (c.path)",
         "CREATE INDEX file_path IF NOT EXISTS FOR (f:File) ON (f.path)",
         "CREATE INDEX function_lang IF NOT EXISTS FOR (f:Function) ON (f.lang)",
         "CREATE INDEX class_lang IF NOT EXISTS FOR (c:Class) ON (c.lang)",
     )
 
+    # Pre-v1.2 full-text index. `_translate_schema_query` rewrites
+    # `CREATE FULLTEXT INDEX` to a `RETURN 1` no-op — FalkorDB full-text
+    # indexes are not wired up through the wrapper, so this currently
+    # creates nothing. Kept verbatim; wiring it up is out of P1b scope.
     _SCHEMA_FULLTEXT_INDEX = """
         CREATE FULLTEXT INDEX code_search_index IF NOT EXISTS
         FOR (n:Function|Class|Variable)
@@ -194,14 +208,15 @@ class GraphBuilder:
 
         Each statement runs in its own ``try`` (v1.2 P1b). The previous code
         wrapped every statement in a single ``try`` block — so the first
-        ``CREATE CONSTRAINT`` (Neo4j syntax FalkorDB rejects) raised and
-        skipped *every* index, including the lookup indexes the CALLS flush
-        depends on. The engine had been running with no indexes at all.
+        ``CREATE CONSTRAINT`` (single-key, rewritten to a form FalkorDB
+        rejects) raised and skipped *every* statement after it, including the
+        composite-constraint downgrades and the explicit indexes the CALLS
+        flush depends on. The engine had been running with no indexes at all.
         """
         with self.driver.session() as session:
-            # Constraints: currently all rejected by FalkorDB. Run them
-            # anyway (cheap, and they self-heal if FalkorDB gains support),
-            # but isolate each so a failure cannot abort index creation.
+            # Constraints: see _SCHEMA_CONSTRAINTS. The composite-key ones are
+            # downgraded to indexes and succeed; the single-key ones are
+            # rejected. Isolate each so a rejection cannot abort the rest.
             constraint_failures = 0
             for statement in self._SCHEMA_CONSTRAINTS:
                 try:
@@ -210,9 +225,9 @@ class GraphBuilder:
                     constraint_failures += 1
             if constraint_failures:
                 warning_logger(
-                    f"{constraint_failures}/{len(self._SCHEMA_CONSTRAINTS)} schema "
-                    "constraints not created (FalkorDB rejects Neo4j CREATE "
-                    "CONSTRAINT syntax); uniqueness relies on MERGE keys instead"
+                    f"{constraint_failures}/{len(self._SCHEMA_CONSTRAINTS)} CREATE "
+                    "CONSTRAINT statements rejected by FalkorDB (single-key "
+                    "constraints); see create_schema. Uniqueness relies on MERGE keys"
                 )
 
             for statement in self._SCHEMA_INDEXES:
