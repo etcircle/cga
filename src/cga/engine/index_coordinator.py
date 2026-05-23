@@ -89,19 +89,25 @@ class IncrementalIndexCoordinator:
             [Path(p) for p in self._all_file_data]
         )
 
-        # Replace node-level state for each changed path. Supported files
-        # go through update_file_in_graph (delete + re-add). Unsupported
-        # files get a minimal File node so warm refresh matches cold (cold
-        # adds minimal nodes for unparseable files; update_file_in_graph
-        # does not).
+        # Replace node-level state for each changed path. Mirror cold's
+        # build_graph_from_path_async logic: parse → full nodes; parse-error
+        # or unsupported suffix → minimal File node (cold uses
+        # add_minimal_file_node for those). update_file_in_graph alone
+        # deletes-but-doesn't-re-add on parse error, so we patch that
+        # branch by adding a minimal node when its result is None.
         for path_str in changed_paths:
             p = Path(path_str)
             resolved = str(p.resolve())
             if p.exists() and p.is_file():
                 if p.suffix in self.graph_builder.parsers:
-                    self.graph_builder.update_file_in_graph(
+                    result = self.graph_builder.update_file_in_graph(
                         p, self.repo_path, self._imports_map
                     )
+                    if result is None:
+                        # Parser error on a supported file; cold creates a
+                        # minimal node, so mirror that to preserve byte-
+                        # identity for File counts.
+                        self.graph_builder.add_minimal_file_node(p, self.repo_path)
                 else:
                     self.graph_builder.delete_file_from_graph(resolved)
                     self.graph_builder.add_minimal_file_node(p, self.repo_path)

@@ -91,8 +91,13 @@ def test_warm_coordinator_matches_post_edit_cold_index(tmp_path: Path) -> None:
             f.write("\ndef added():\n    return 2\n")
         readme = (repo / "README.md").resolve()
         readme.write_text("# updated\n")
+        # Mutate file_b into a parse error to exercise the
+        # supported-but-unparseable branch -- cold creates a minimal File
+        # node for it, so warm refresh must too.
+        file_b = (repo / "file_b.py").resolve()
+        file_b.write_text("def caller(:\n    bad_syntax_here\n")
 
-        coordinator.refresh_warm({str(file_a), str(readme)})
+        coordinator.refresh_warm({str(file_a), str(readme), str(file_b)})
         asyncio.run(builder_b.build_graph_from_path_async(repo))
 
         counts_a = _counts(manager_a)
