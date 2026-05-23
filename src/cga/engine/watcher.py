@@ -300,7 +300,31 @@ class RepositoryEventHandler(FileSystemEventHandler):
                 else:
                     self.imports_map[symbol] = paths_list
 
-    def _incremental_relink(self, changed_paths: set):
+    def _callers_into(self, changed_paths: set) -> set:
+        """Return distinct caller file paths that currently have CALLS edges into nodes
+        at any of changed_paths. Must be called BEFORE update_file_in_graph runs on
+        those paths -- otherwise the edges will already be gone.
+        """
+        if not changed_paths:
+            return set()
+        paths_list = list(changed_paths)
+        try:
+            with self.graph_builder.driver.session() as session:
+                rows = session.run(
+                    "MATCH (caller)-[:CALLS]->(target) "
+                    "WHERE target.path IN $paths "
+                    "RETURN DISTINCT caller.path AS path",
+                    paths=paths_list,
+                )
+                return {row["path"] for row in rows if row.get("path")}
+        except Exception as exc:  # noqa: BLE001
+            warning_logger(
+                f"_callers_into query failed: {exc}; "
+                f"falling back to import-only affected set"
+            )
+            return set()
+
+    def _incremental_relink(self, changed_paths: set, reverse_callers: set | None = None):
         """Re-link only edges involving changed files + files that import changed symbols."""
         # 1. Identify symbols defined in changed files
         changed_symbols = set()
@@ -312,8 +336,10 @@ class RepositoryEventHandler(FileSystemEventHandler):
                 for cls in data.get("classes", []):
                     changed_symbols.add(cls["name"])
 
-        # 2. Find affected files: changed files + files that import changed symbols
-        affected_paths = set(changed_paths)
+        # 2. Find affected files: changed files + files that import
+        # changed symbols + callers-into-changed-files (the
+        # reverse-edge seed, design doc §3.4)
+        affected_paths = set(changed_paths) | (reverse_callers or set())
         for path_str, data in self.all_file_data.items():
             for imp in data.get("imports", []):
                 imp_name = imp.get("alias") or imp["name"].split(".")[-1]
@@ -447,6 +473,14 @@ class RepositoryEventHandler(FileSystemEventHandler):
 
         # 2-4. Incremental graph update
         try:
+            # Reverse-edge seed: capture callers-into-changed-files
+            # BEFORE the upcoming update_file_in_graph detaches those
+            # edges (design doc §3.4).
+            resolved_changed = {
+                str(Path(p).resolve()) for p in successfully_processed
+            }
+            reverse_callers = self._callers_into(resolved_changed)
+
             # 2. Incremental imports map update
             self._update_imports_map_incrementally(successfully_processed)
 
@@ -465,7 +499,7 @@ class RepositoryEventHandler(FileSystemEventHandler):
                 self._needs_full_relink = False
                 info_logger("Full re-link recovery completed")
             else:
-                self._incremental_relink(successfully_processed)
+                self._incremental_relink(successfully_processed, reverse_callers)
             self._circuit_breaker.record_success()
         except Exception as e:
             error_logger(f"Graph update failed: {e}")
