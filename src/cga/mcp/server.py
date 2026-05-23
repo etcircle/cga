@@ -20,6 +20,7 @@ from mcp.server.stdio import stdio_server
 from cga.config import Config
 from cga.db.database import FalkorDBManager
 from cga.engine.graph_builder import GraphBuilder
+from cga.engine.index_coordinator import IncrementalIndexCoordinator
 from cga.jobs import JobInfo, JobManager, JobStatus
 from cga.query.core import QueryCore
 from cga.tools.registry import ToolRegistry
@@ -84,6 +85,9 @@ class CGAMCPServer:
         self.db_manager = FalkorDBManager(self.config, graph_name=self.graph_name)
         self.job_manager = JobManager()
         self.graph_builder = GraphBuilder(self.config, self.db_manager, self.job_manager)
+        self.coordinator = IncrementalIndexCoordinator(
+            self.graph_builder, self.repo_root
+        )
         self.query_core = QueryCore(self.db_manager)
         self.registry = ToolRegistry()
         self._index_lock = threading.Lock()
@@ -228,29 +232,13 @@ class CGAMCPServer:
             current = self._scan_source_mtimes()
             changed = sorted(path for path, mtime in current.items() if previous.get(path) != mtime)
             deleted = sorted(path for path in previous if path not in current)
-
             if changed or deleted:
-                imports_map = self.graph_builder._pre_scan_for_imports(  # noqa: SLF001
-                    [Path(path) for path in current]
-                )
-                for path in deleted:
-                    self.graph_builder.delete_file_from_graph(path)
-                for path in changed:
-                    self.graph_builder.delete_file_from_graph(path)
-                    self._index_one_file(Path(path), imports_map)
+                batch = {*changed, *deleted}
+                self.coordinator.refresh_warm(batch)
                 self._write_mtime_sidecar(current)
         except Exception as exc:
             return {"status": "error", "warnings": [str(exc)], "results": []}
         return None
-
-    def _index_one_file(self, path: Path, imports_map: dict[str, Any]) -> None:
-        file_data = self.graph_builder.parse_file(self.repo_root, path, is_dependency=False)
-        if "error" in file_data:
-            self.graph_builder.add_minimal_file_node(path, self.repo_root, is_dependency=False)
-        else:
-            self.graph_builder.add_file_to_graph(file_data, self.repo_root.name, imports_map)
-            self.graph_builder._create_all_inheritance_links([file_data], imports_map)  # noqa: SLF001
-            self.graph_builder._create_all_function_calls([file_data], imports_map)  # noqa: SLF001
 
     def _file_count(self) -> int | None:
         try:

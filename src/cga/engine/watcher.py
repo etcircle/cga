@@ -21,6 +21,7 @@ from watchdog.events import FileSystemEventHandler
 if typing.TYPE_CHECKING:
     from cga.engine.graph_builder import GraphBuilder
 
+from cga.engine.index_coordinator import IncrementalIndexCoordinator
 from cga.utils.debug_log import info_logger, error_logger, warning_logger
 
 # Directories always ignored regardless of repo ignore files.
@@ -86,6 +87,12 @@ class RepositoryEventHandler(FileSystemEventHandler):
         """
         super().__init__()
         self.graph_builder = graph_builder
+        self.coordinator = IncrementalIndexCoordinator(
+            graph_builder, repo_path
+        )
+        self._affected_set_threshold = float(
+            os.getenv("CGA_AFFECTED_SET_THRESHOLD", "0.2")
+        )
         self.repo_path = repo_path
 
         # Configurable debounce from env var (spec default: 5s, was 2s)
@@ -492,14 +499,28 @@ class RepositoryEventHandler(FileSystemEventHandler):
 
             # 4. Incremental re-link (edges only for changed + affected)
             if self._needs_full_relink:
-                # Recovery: do full re-link once, then clear flag
-                all_data = list(self.all_file_data.values())
-                self.graph_builder._create_all_function_calls(all_data, self.imports_map)
-                self.graph_builder._create_all_inheritance_links(all_data, self.imports_map)
+                # Recovery: warm whole-edge re-index via coordinator
+                # (byte-identical to cold; chunks 3+4).
+                self.coordinator.refresh_warm(
+                    successfully_processed | ignored_paths
+                )
                 self._needs_full_relink = False
-                info_logger("Full re-link recovery completed")
+                info_logger("Full re-link recovery completed (warm coordinator)")
             else:
-                self._incremental_relink(successfully_processed, reverse_callers)
+                affected_ratio = (
+                    len(set(successfully_processed) | reverse_callers)
+                    / max(len(self.all_file_data), 1)
+                )
+                if affected_ratio > self._affected_set_threshold:
+                    info_logger(
+                        f"Affected set broad ({affected_ratio:.1%} of cache); "
+                        f"falling back to warm whole-edge re-index"
+                    )
+                    self.coordinator.refresh_warm(
+                        successfully_processed | ignored_paths
+                    )
+                else:
+                    self._incremental_relink(successfully_processed, reverse_callers)
             self._circuit_breaker.record_success()
         except Exception as e:
             error_logger(f"Graph update failed: {e}")
