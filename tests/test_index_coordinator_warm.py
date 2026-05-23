@@ -75,6 +75,9 @@ def test_warm_coordinator_matches_post_edit_cold_index(tmp_path: Path) -> None:
             "def caller():\n"
             "    return hub()\n"
         )
+        # Unsupported file -- cold creates a minimal File node for it;
+        # warm refresh must preserve that behavior on mutation.
+        (repo / "README.md").write_text("# original\n")
 
         builder_a = GraphBuilder(config, manager_a, JobManager())
         builder_b = GraphBuilder(config, manager_b, JobManager())
@@ -86,8 +89,10 @@ def test_warm_coordinator_matches_post_edit_cold_index(tmp_path: Path) -> None:
         file_a = (repo / "file_a.py").resolve()
         with file_a.open("a") as f:
             f.write("\ndef added():\n    return 2\n")
+        readme = (repo / "README.md").resolve()
+        readme.write_text("# updated\n")
 
-        coordinator.refresh_warm({str(file_a)})
+        coordinator.refresh_warm({str(file_a), str(readme)})
         asyncio.run(builder_b.build_graph_from_path_async(repo))
 
         counts_a = _counts(manager_a)

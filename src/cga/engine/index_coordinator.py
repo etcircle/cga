@@ -46,6 +46,10 @@ class IncrementalIndexCoordinator:
         )
 
     def _wipe_cross_edges(self) -> None:
+        # NOTE: assumes one-graph-per-repo (CGA's MCP model -- see
+        # server.py:graph_name_for_repo). If a future caller ever shares a
+        # single graph across repos (legacy CodeWatcher pattern), this wipe
+        # must be scoped to nodes whose path is under self.repo_path.
         with self.graph_builder.driver.session() as session:
             session.run("MATCH ()-[r:CALLS]->() DELETE r")
             session.run("MATCH ()-[r:INHERITS]->() DELETE r")
@@ -85,13 +89,24 @@ class IncrementalIndexCoordinator:
             [Path(p) for p in self._all_file_data]
         )
 
-        # Replace node-level state for each changed path
-        # (handles delete + re-add for modified, delete for removed,
-        # add for new).
+        # Replace node-level state for each changed path. Supported files
+        # go through update_file_in_graph (delete + re-add). Unsupported
+        # files get a minimal File node so warm refresh matches cold (cold
+        # adds minimal nodes for unparseable files; update_file_in_graph
+        # does not).
         for path_str in changed_paths:
-            self.graph_builder.update_file_in_graph(
-                Path(path_str), self.repo_path, self._imports_map
-            )
+            p = Path(path_str)
+            resolved = str(p.resolve())
+            if p.exists() and p.is_file():
+                if p.suffix in self.graph_builder.parsers:
+                    self.graph_builder.update_file_in_graph(
+                        p, self.repo_path, self._imports_map
+                    )
+                else:
+                    self.graph_builder.delete_file_from_graph(resolved)
+                    self.graph_builder.add_minimal_file_node(p, self.repo_path)
+            else:
+                self.graph_builder.delete_file_from_graph(resolved)
 
         # Wipe all cross-edges and recreate from the complete cache,
         # strict mode (silent chunk failures re-raise -- design doc §2.2).
