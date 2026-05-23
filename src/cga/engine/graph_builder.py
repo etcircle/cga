@@ -1463,6 +1463,12 @@ class GraphBuilder:
             if job_id:
                 self.job_manager.update_job(job_id, status=JobStatus.RUNNING)
 
+            # Resolve symlinks so .cgcignore relative_to filter works when the
+            # caller passes an unresolved path (e.g. macOS /tmp -> /private/tmp).
+            # Without this, relative_to raises ValueError and the except-branch
+            # below silently keeps every file -- disabling .cgcignore entirely.
+            path = path.resolve()
+
             _t = _phase_start()
             self.add_repository_to_graph(path, is_dependency)
             _phase_end("repository_node", _t)
