@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import signal
 import sys
 import time
 from pathlib import Path
@@ -54,7 +55,18 @@ def _run_watch(path_arg: str) -> int:
     graph_was_empty = node_count == 0
     if graph_was_empty:
         print(f"Cold indexing {path}...")
-        asyncio.run(graph_builder.build_graph_from_path_async(path))
+
+        def _raise_kbd_interrupt(signum, _frame):
+            raise KeyboardInterrupt(f"signal {signum}")
+
+        prev_term = signal.signal(signal.SIGTERM, _raise_kbd_interrupt)
+        try:
+            asyncio.run(graph_builder.build_graph_from_path_async(path))
+        except KeyboardInterrupt:
+            print("\nCold indexing interrupted.", file=sys.stderr)
+            return 0
+        finally:
+            signal.signal(signal.SIGTERM, prev_term)
         print(f"Cold indexing complete for {path}.")
     else:
         print(f"Graph already indexed ({node_count} nodes); resuming watcher.")
