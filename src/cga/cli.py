@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import signal
 import sys
 import time
@@ -73,9 +74,15 @@ def _run_watch(path_arg: str) -> int:
 
     watcher = CodeWatcher(graph_builder)
     if sys.platform == "darwin":
-        from watchdog.observers.kqueue import KqueueObserver
+        observer_kind = os.environ.get("CGA_WATCHER_OBSERVER", "kqueue").lower()
+        if observer_kind == "polling":
+            from watchdog.observers.polling import PollingObserver
 
-        watcher.observer = KqueueObserver()
+            watcher.observer = PollingObserver()
+        else:
+            from watchdog.observers.kqueue import KqueueObserver
+
+            watcher.observer = KqueueObserver()
     watcher.watch_directory(str(path), perform_initial_scan=not graph_was_empty)
     watcher.start()
     print(f"Watcher started for {path}.")
